@@ -1,0 +1,9 @@
+* text=auto
+
+# Keep shell and config files diff-friendly
+*.ps1 text
+*.py text
+*.md text
+*.yml text
+*.yaml text
+*.ini text

@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Conda
+.conda/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Local runtime files
+*.log
+*.pid
+*.out
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Database and local state
+*.db
+*.sqlite
+*.sqlite3
+instance/
+
+# Cloudflare local artifacts
+cloudflared.exe
+cloudflared
+.cloudflared/
+
+# OS
+.DS_Store
+Thumbs.db

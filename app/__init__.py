@@ -1,0 +1,2 @@
+"""MemoMate application package."""
+
