@@ -17,6 +17,25 @@ class OllamaClient:
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        timeout_seconds: int | None = None,
+        options: dict[str, Any] | None = None,
+        retries: int = 2,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": model or self.settings.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        if options:
+            payload["options"] = options
+        data = self._request_generate(payload, timeout_seconds=timeout_seconds, retries=retries)
+        return str(data.get("response", "")).strip()
+
     def generate_json(
         self,
         prompt: str,
@@ -26,7 +45,6 @@ class OllamaClient:
         options: dict[str, Any] | None = None,
         retries: int = 2,
     ) -> dict[str, Any]:
-        url = f"{self.settings.ollama_base_url.rstrip('/')}/api/generate"
         payload: dict[str, Any] = {
             "model": model or self.settings.ollama_model,
             "prompt": prompt,
@@ -36,21 +54,31 @@ class OllamaClient:
         if options:
             payload["options"] = options
 
+        data = self._request_generate(payload, timeout_seconds=timeout_seconds, retries=retries)
+        raw = data.get("response", "{}")
+        return orjson.loads(raw)
+
+    def _request_generate(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int | None,
+        retries: int,
+    ) -> dict[str, Any]:
+        url = f"{self.settings.ollama_base_url.rstrip('/')}/api/generate"
         last_error: Exception | None = None
         for _ in range(max(1, retries)):
             try:
                 with httpx.Client(timeout=timeout_seconds or self.settings.ollama_timeout_seconds) as client:
                     response = client.post(url, json=payload)
                     response.raise_for_status()
-                    data = response.json()
-                raw = data.get("response", "{}")
-                return orjson.loads(raw)
+                    return response.json()
             except Exception as exc:
                 last_error = exc
-                logger.warning("ollama_generate_json_failed error=%s", exc)
+                logger.warning("ollama_generate_failed error=%s", exc)
         if last_error:
             raise last_error
-        return {}
+        return {"response": ""}
 
     def healthcheck(self) -> bool:
         url = f"{self.settings.ollama_base_url.rstrip('/')}/api/tags"

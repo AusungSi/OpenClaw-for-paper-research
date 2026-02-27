@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import secrets
 from datetime import timedelta
 from time import perf_counter
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.timezone import now_utc
 from app.core.logging import get_logger
-from app.domain.enums import OperationType, PendingActionStatus, VoiceRecordStatus
+from app.domain.enums import OperationType, PendingActionStatus, ReminderSource, VoiceRecordStatus
 from app.domain.models import User
 from app.domain.schemas import IntentDraft
 from app.infra.repos import InboundMessageRepo, MobileRepo, PendingActionRepo, UserRepo, VoiceRecordRepo
@@ -59,6 +60,8 @@ class MessageIngestService:
         msg_id: str,
         raw_xml: str,
         text: str,
+        reply_sink: Callable[[str], None] | None = None,
+        message_source: ReminderSource = ReminderSource.WECHAT,
     ) -> None:
         user_repo = UserRepo(db)
         inbound_repo = InboundMessageRepo(db)
@@ -73,7 +76,7 @@ class MessageIngestService:
                 msg_id,
                 wecom_user_id,
             )
-            self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback())
+            self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback(), reply_sink=reply_sink)
             return
         if not is_new:
             self.dedup_duplicates += 1
@@ -83,7 +86,16 @@ class MessageIngestService:
                 wecom_user_id,
             )
             return
-        self._handle_normalized_message(db, user, wecom_user_id, msg_id, text.strip(), inbound_repo)
+        self._handle_normalized_message(
+            db,
+            user,
+            wecom_user_id,
+            msg_id,
+            text.strip(),
+            inbound_repo,
+            reply_sink=reply_sink,
+            message_source=message_source,
+        )
 
     def process_voice_message(
         self,
@@ -206,11 +218,13 @@ class MessageIngestService:
         msg_id: str,
         normalized: str,
         inbound_repo: InboundMessageRepo,
+        reply_sink: Callable[[str], None] | None = None,
+        message_source: ReminderSource = ReminderSource.WECHAT,
     ) -> None:
         pending_repo = PendingActionRepo(db)
 
         if not normalized:
-            self._send_user_text(wecom_user_id, self.reply_renderer.empty_message())
+            self._send_user_text(wecom_user_id, self.reply_renderer.empty_message(), reply_sink=reply_sink)
             return
 
         if self._is_pair_command(normalized):
@@ -218,6 +232,7 @@ class MessageIngestService:
             self._send_user_text(
                 wecom_user_id,
                 self.reply_renderer.pair_code(code, self.settings.pair_code_minutes),
+                reply_sink=reply_sink,
             )
             return
 
@@ -234,16 +249,16 @@ class MessageIngestService:
                         msg_id,
                         wecom_user_id,
                     )
-                    self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback())
+                    self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback(), reply_sink=reply_sink)
                     return
                 pending_repo.mark_status(pending, PendingActionStatus.CONFIRMED)
-                self._send_user_text(wecom_user_id, result)
+                self._send_user_text(wecom_user_id, result, reply_sink=reply_sink)
                 return
             if decision == PendingActionStatus.REJECTED:
                 pending_repo.mark_status(pending, PendingActionStatus.REJECTED)
-                self._send_user_text(wecom_user_id, self.reply_renderer.action_canceled())
+                self._send_user_text(wecom_user_id, self.reply_renderer.action_canceled(), reply_sink=reply_sink)
                 return
-            self._send_user_text(wecom_user_id, self.reply_renderer.pending_action_waiting())
+            self._send_user_text(wecom_user_id, self.reply_renderer.pending_action_waiting(), reply_sink=reply_sink)
             return
 
         try:
@@ -255,10 +270,15 @@ class MessageIngestService:
                 msg_id,
                 wecom_user_id,
             )
-            self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback())
+            self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback(), reply_sink=reply_sink)
             return
+        draft.source = message_source
         if draft.clarification_question:
-            self._send_user_text(wecom_user_id, self.reply_renderer.clarification(draft.clarification_question))
+            self._send_user_text(
+                wecom_user_id,
+                self.reply_renderer.clarification(draft.clarification_question),
+                reply_sink=reply_sink,
+            )
             return
 
         if draft.operation == OperationType.QUERY:
@@ -274,9 +294,9 @@ class MessageIngestService:
                     msg_id,
                     wecom_user_id,
                 )
-                self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback())
+                self._send_user_text(wecom_user_id, self.reply_renderer.busy_fallback(), reply_sink=reply_sink)
                 return
-            self._send_user_text(wecom_user_id, summary)
+            self._send_user_text(wecom_user_id, summary, reply_sink=reply_sink)
             return
 
         self.confirm_service.create_pending_action(
@@ -297,7 +317,7 @@ class MessageIngestService:
         reply = fallback
         if self.reply_generation_service:
             reply = self.reply_generation_service.generate_confirmation_prompt(draft, fallback)
-        self._send_user_text(wecom_user_id, reply)
+        self._send_user_text(wecom_user_id, reply, reply_sink=reply_sink)
 
     @staticmethod
     def _is_pair_command(text: str) -> bool:
@@ -310,7 +330,15 @@ class MessageIngestService:
         MobileRepo(db).create_pair_code(user_id=user_id, pair_code=code, expires_at=expires)
         return code
 
-    def _send_user_text(self, wecom_user_id: str, content: str) -> None:
+    def _send_user_text(
+        self,
+        wecom_user_id: str,
+        content: str,
+        reply_sink: Callable[[str], None] | None = None,
+    ) -> None:
+        if reply_sink:
+            reply_sink(content)
+            return
         ok, error = self.wecom_client.send_text(wecom_user_id, content)
         if not ok:
             logger.warning(

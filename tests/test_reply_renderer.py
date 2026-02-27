@@ -16,15 +16,7 @@ def test_confirmation_prompt_golden():
         run_at_local="2026-02-27T09:00:00+08:00",
         rrule=None,
     )
-    expected = (
-        "我理解的是下面这件事，你看对不对：\n"
-        "• 操作：新增提醒\n"
-        "• 内容：明天开会\n"
-        "• 时区：Asia/Shanghai\n"
-        "• 调度：one_time\n"
-        "• 时间：2026-02-27 09:00（北京时间）\n"
-        "如果没问题，直接回复“确认”就行。"
-    )
+    expected = "我会在 2026-02-27 09:00（北京时间） 提醒你“明天开会”。如果这样安排对的话，回复“确认”就行。"
     assert text == expected
 
 
@@ -38,4 +30,4 @@ def test_add_success_golden():
 def test_query_summary_golden():
     renderer = ReplyRenderer()
     text = renderer.query_summary([(1, "开会", "2026-02-27 09:00（北京时间）")])
-    assert text == "我帮你看了下，最近待提醒的是：\n• [1] 开会，2026-02-27 09:00（北京时间）"
+    assert text == "你现在有 1 条待提醒：[1] 开会，我会在 2026-02-27 09:00（北京时间） 提醒你。"

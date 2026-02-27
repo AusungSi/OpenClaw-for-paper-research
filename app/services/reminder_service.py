@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.timezone import format_user_time, local_to_utc, now_utc, utc_to_local
-from app.domain.enums import OperationType, ReminderStatus, ScheduleType
+from app.domain.enums import OperationType, ReminderSource, ReminderStatus, ScheduleType
 from app.domain.models import Reminder
 from app.domain.schemas import IntentDraft, ReminderCreateRequest, ReminderResponse, ReminderUpdateRequest
 from app.infra.repos import ReminderRepo
@@ -57,6 +57,7 @@ class ReminderService:
             user_id=user_id,
             content=draft.content,
             schedule_type=draft.schedule,
+            source=draft.source,
             run_at_utc=run_utc,
             rrule=rrule_text,
             timezone=draft.timezone,
@@ -88,17 +89,35 @@ class ReminderService:
         if draft.operation == OperationType.DELETE:
             target = reminder_repo.find_first_by_keyword(user_id, draft.content)
             if not target:
-                return self.reply_renderer.not_found_for_delete()
+                fallback = self.reply_renderer.not_found_for_delete()
+                if not self.reply_generation_service:
+                    return fallback
+                return self.reply_generation_service.generate_not_found_delete(
+                    keyword=draft.content,
+                    fallback=fallback,
+                )
             target.status = ReminderStatus.CANCELED
             target.updated_at = now
             db.add(target)
             db.flush()
-            return self.reply_renderer.delete_success(target.content)
+            fallback = self.reply_renderer.delete_success(target.content)
+            if not self.reply_generation_service:
+                return fallback
+            return self.reply_generation_service.generate_delete_success(
+                content=target.content,
+                fallback=fallback,
+            )
 
         if draft.operation == OperationType.UPDATE:
             target = reminder_repo.find_first_by_keyword(user_id, draft.content)
             if not target:
-                return self.reply_renderer.not_found_for_update()
+                fallback = self.reply_renderer.not_found_for_update()
+                if not self.reply_generation_service:
+                    return fallback
+                return self.reply_generation_service.generate_not_found_update(
+                    keyword=draft.content,
+                    fallback=fallback,
+                )
             if draft.run_at_local:
                 run_local = date_parser.parse(draft.run_at_local)
                 run_utc = local_to_utc(run_local, draft.timezone)
@@ -111,7 +130,15 @@ class ReminderService:
             target.updated_at = now
             db.add(target)
             db.flush()
-            return self.reply_renderer.update_success(target.content)
+            fallback = self.reply_renderer.update_success(target.content)
+            if not self.reply_generation_service:
+                return fallback
+            when_text = format_user_time(target.next_run_utc, target.timezone) if target.next_run_utc else None
+            return self.reply_generation_service.generate_update_success(
+                content=target.content,
+                when_text=when_text,
+                fallback=fallback,
+            )
 
         return "查询不需要确认。"
 
@@ -132,6 +159,7 @@ class ReminderService:
                 id=item.id,
                 content=item.content,
                 schedule_type=item.schedule_type,
+                source=item.source,
                 run_at_utc=item.run_at_utc,
                 rrule=item.rrule,
                 timezone=item.timezone,
@@ -147,6 +175,7 @@ class ReminderService:
             operation=OperationType.ADD,
             content=payload.content,
             timezone=payload.timezone,
+            source=ReminderSource.MOBILE_API,
             schedule=payload.schedule_type,
             run_at_local=payload.run_at_local,
             rrule=payload.rrule,

@@ -18,6 +18,7 @@ from app.domain.enums import (
     DeliveryStatus,
     OperationType,
     PendingActionStatus,
+    ReminderSource,
     ReminderStatus,
     ScheduleType,
     VoiceRecordStatus,
@@ -77,6 +78,7 @@ class Reminder(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     schedule_type: Mapped[ScheduleType] = mapped_column(Enum(ScheduleType), nullable=False)
+    source: Mapped[ReminderSource] = mapped_column(Enum(ReminderSource), nullable=False, default=ReminderSource.WECHAT)
     run_at_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rrule: Mapped[str | None] = mapped_column(Text, nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False)

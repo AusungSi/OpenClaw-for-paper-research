@@ -9,7 +9,7 @@ from dateutil import parser as date_parser
 from app.core.logging import get_logger
 from app.core.config import get_settings
 from app.domain.enums import OperationType, ScheduleType
-from app.domain.schemas import IntentDraft
+from app.domain.schemas import IntentDraft, IntentLite
 from app.llm.ollama_client import OllamaClient, load_prompt_template
 from app.llm.providers import IntentLLMProvider, LlmProviderError, LocalOllamaIntentProvider
 
@@ -43,7 +43,20 @@ class IntentService:
         providers = self.intent_providers if self.settings.intent_fallback_enabled else self.intent_providers[:1]
         for provider in providers:
             try:
-                draft = provider.parse_intent(text, timezone_name, context_messages or [])
+                lite = provider.parse_intent(text, timezone_name, context_messages or [])
+                logger.info(
+                    "intent_parsed intent_stage=lite provider=%s prompt_version=%s operation=%s",
+                    provider.name,
+                    getattr(provider, "prompt_version", "unknown"),
+                    lite.operation.value,
+                )
+                draft = self.normalize_intent_lite(lite, text=text, timezone_name=timezone_name, now_local=now_local)
+                logger.info(
+                    "intent_parsed intent_stage=normalized provider=%s operation=%s schedule=%s",
+                    provider.name,
+                    draft.operation.value,
+                    draft.schedule.value if draft.schedule else "null",
+                )
                 self._last_error = None
                 return draft
             except LlmProviderError as exc:
@@ -52,7 +65,63 @@ class IntentService:
             except Exception as exc:
                 self._last_error = str(exc)
                 logger.warning("intent_provider_failed provider=%s error=%s", provider.name, exc)
-        return self._parse_fallback(text, timezone_name, now_local)
+        draft = self._parse_fallback(text, timezone_name, now_local)
+        logger.info("intent_parsed intent_stage=normalized provider=fallback operation=%s", draft.operation.value)
+        return draft
+
+    def normalize_intent_lite(
+        self,
+        lite: IntentLite,
+        *,
+        text: str,
+        timezone_name: str,
+        now_local: datetime | None = None,
+    ) -> IntentDraft:
+        now = now_local or datetime.now(ZoneInfo(timezone_name))
+        operation = lite.operation
+        raw_content = (lite.content or "").strip()
+        extracted_content = self._extract_content(text.strip(), operation)
+        content = raw_content or extracted_content
+        if operation == OperationType.QUERY and content == "未命名提醒":
+            content = ""
+
+        schedule: ScheduleType | None = None
+        run_at_local: str | None = None
+        rrule: str | None = None
+        clarification_question = (lite.clarification_question or "").strip() or None
+
+        if operation in (OperationType.DELETE, OperationType.UPDATE) and (not content or self._looks_like_time_phrase(content)):
+            clarification_question = clarification_question or "你想删除或修改哪一条提醒？可以发关键词或编号。"
+
+        if operation in (OperationType.ADD, OperationType.UPDATE):
+            time_source = self._compose_time_source(text=text, when_text=lite.when_text)
+            rrule = self._build_rrule(time_source)
+            has_time = self._has_time_expression(time_source) or bool(rrule)
+            if not has_time:
+                clarification_question = clarification_question or "你想让我什么时候提醒你？比如：明天早上9点。"
+            else:
+                parsed_dt = self._extract_datetime(time_source, now)
+                if rrule:
+                    schedule = ScheduleType.RRULE
+                    run_at_local = parsed_dt.isoformat()
+                else:
+                    schedule = ScheduleType.ONE_TIME
+                    run_at_local = parsed_dt.isoformat()
+
+        if operation == OperationType.QUERY:
+            clarification_question = None
+
+        return IntentDraft(
+            operation=operation,
+            content=content,
+            timezone=timezone_name,
+            schedule=schedule,
+            run_at_local=run_at_local,
+            rrule=rrule,
+            confidence=lite.confidence,
+            needs_confirmation=operation != OperationType.QUERY,
+            clarification_question=clarification_question,
+        )
 
     @property
     def last_error(self) -> str | None:
@@ -84,15 +153,17 @@ class IntentService:
 
         if operation in (OperationType.ADD, OperationType.UPDATE):
             rrule = self._build_rrule(cleaned)
-            parsed_dt = self._extract_datetime(cleaned, now_local)
-            if rrule:
-                schedule = ScheduleType.RRULE
-                run_at_local = parsed_dt.isoformat()
-            elif parsed_dt:
-                schedule = ScheduleType.ONE_TIME
-                run_at_local = parsed_dt.isoformat()
-            else:
+            has_time = self._has_time_expression(cleaned) or bool(rrule)
+            if not has_time:
                 clarification_question = "请补充具体提醒时间，例如：明天早上9点。"
+            else:
+                parsed_dt = self._extract_datetime(cleaned, now_local)
+                if rrule:
+                    schedule = ScheduleType.RRULE
+                    run_at_local = parsed_dt.isoformat()
+                else:
+                    schedule = ScheduleType.ONE_TIME
+                    run_at_local = parsed_dt.isoformat()
 
         confidence = 0.65 if clarification_question is None else 0.4
         needs_confirmation = operation != OperationType.QUERY
@@ -199,3 +270,47 @@ class IntentService:
         if "每年" in text:
             return "FREQ=YEARLY"
         return None
+
+    @staticmethod
+    def _compose_time_source(*, text: str, when_text: str | None) -> str:
+        parts = []
+        if when_text and when_text.strip():
+            parts.append(when_text.strip())
+        if text and text.strip():
+            parts.append(text.strip())
+        return " ".join(parts).strip()
+
+    @staticmethod
+    def _has_time_expression(text: str) -> bool:
+        if not text:
+            return False
+        keywords = (
+            "今天",
+            "明天",
+            "后天",
+            "大后天",
+            "上午",
+            "中午",
+            "下午",
+            "晚上",
+            "早上",
+            "凌晨",
+            "下周",
+            "每周",
+            "每月",
+            "每年",
+            "每天",
+            "每日",
+        )
+        if any(k in text for k in keywords):
+            return True
+        return re.search(r"\d{1,2}[:：点]\d{0,2}", text) is not None
+
+    @classmethod
+    def _looks_like_time_phrase(cls, text: str) -> bool:
+        value = (text or "").strip()
+        if not value:
+            return False
+        if len(value) <= 2:
+            return False
+        return cls._has_time_expression(value)

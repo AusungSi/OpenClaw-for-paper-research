@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.admin import router as admin_router
 from app.api.health import router as health_router
 from app.api.mobile import router as mobile_router
 from app.api.wechat import router as wechat_router
@@ -86,3 +87,4 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(wechat_router)
 app.include_router(health_router)
 app.include_router(mobile_router)
+app.include_router(admin_router)

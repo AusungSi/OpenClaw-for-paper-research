@@ -3,21 +3,17 @@ Output strict JSON only with this schema:
 {
   "operation": "add|query|delete|update",
   "content": "string",
-  "timezone": "IANA timezone string",
-  "schedule": "one_time|rrule|null",
-  "run_at_local": "ISO datetime string or null",
-  "rrule": "RRULE string or null",
+  "when_text": "string or null",
   "confidence": 0.0,
-  "needs_confirmation": true,
   "clarification_question": "string or null"
 }
 
 Rules:
-1) Query must have needs_confirmation false.
-2) Add, update, delete must have needs_confirmation true.
-3) If schedule is unclear, set clarification_question with a concise question.
-4) If recurring, use valid RFC RRULE content, no DTSTART key.
-5) Do not output any keys outside schema.
+1) Parse only intent semantics: operation, core content, and time expression.
+2) when_text should preserve the user's natural language time phrase (for example: "明天早上9点", "每周五下午").
+3) For query/delete, when_text is usually null unless the user explicitly includes time constraints.
+4) If time is required but unclear for add/update, set clarification_question to a concise Chinese question.
+5) Do not output any keys outside this schema.
 6) If the current message is short or ambiguous, use recent context to complete missing meaning.
 7) Current message has highest priority; context is only supportive and must not override explicit user intent.
 
@@ -26,9 +22,6 @@ Now parse this user text:
 
 Current local time:
 {now_local}
-
-User timezone:
-{timezone}
 
 Recent conversation context (oldest -> latest):
 {conversation_context}

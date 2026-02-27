@@ -41,7 +41,6 @@ class SchedulerService:
         self.started = False
         logger.info("scheduler stopped")
 
-    async def run_dispatch_cycle(self) -> None:
+    async def run_dispatch_cycle(self) -> int:
         with session_scope() as db:
-            self.dispatcher.dispatch_due(db)
-
+            return self.dispatcher.dispatch_due(db)

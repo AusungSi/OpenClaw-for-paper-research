@@ -7,13 +7,23 @@ from app.services.reply_renderer import ReplyRenderer
 
 
 class ValidReplyOllama:
-    def generate_json(self, prompt: str, **kwargs):
-        return {"reply": "安排好啦，明天开会我会在2026-02-27 09:00（北京时间）提醒你。"}
+    def generate_text(self, prompt: str, **kwargs):
+        return "安排好啦，明天开会我会在2026-02-27 09:00（北京时间）提醒你。"
 
 
 class InvalidReplyOllama:
-    def generate_json(self, prompt: str, **kwargs):
-        return {"reply": "好的。"}
+    def generate_text(self, prompt: str, **kwargs):
+        return "好的。"
+
+
+class JsonWrappedReplyOllama:
+    def generate_text(self, prompt: str, **kwargs):
+        return '{"reply":"我会在2026-02-27 09:00（北京时间）提醒你明天开会，回复确认即可。"}'
+
+
+class CodeFenceReplyOllama:
+    def generate_text(self, prompt: str, **kwargs):
+        return "```json\n{\"reply\":\"我会在2026-02-27 09:00（北京时间）提醒你明天开会，回复确认即可。\"}\n```"
 
 
 def test_nlg_add_success_contains_facts():
@@ -54,3 +64,59 @@ def test_nlg_fallback_when_missing_facts():
     result = service.generate_confirmation_prompt(draft, fallback)
     assert result == fallback
     assert service.last_error is not None
+
+
+def test_nlg_can_parse_json_wrapped_reply_text():
+    renderer = ReplyRenderer()
+    draft = IntentDraft(
+        operation=OperationType.ADD,
+        content="明天开会",
+        timezone="Asia/Shanghai",
+        schedule=None,
+        run_at_local="2026-02-27T09:00:00+08:00",
+        rrule=None,
+        confidence=1.0,
+        needs_confirmation=True,
+        clarification_question=None,
+    )
+    fallback = renderer.confirmation_prompt(
+        operation=draft.operation,
+        content=draft.content,
+        timezone=draft.timezone,
+        schedule=None,
+        run_at_local=draft.run_at_local,
+        rrule=draft.rrule,
+    )
+    service = ReplyGenerationService(ollama_client=JsonWrappedReplyOllama())
+    result = service.generate_confirmation_prompt(draft, fallback)
+    assert result != fallback
+    assert "确认" in result
+    assert "明天开会" in result
+
+
+def test_nlg_can_parse_code_fence_reply_text():
+    renderer = ReplyRenderer()
+    draft = IntentDraft(
+        operation=OperationType.ADD,
+        content="明天开会",
+        timezone="Asia/Shanghai",
+        schedule=None,
+        run_at_local="2026-02-27T09:00:00+08:00",
+        rrule=None,
+        confidence=1.0,
+        needs_confirmation=True,
+        clarification_question=None,
+    )
+    fallback = renderer.confirmation_prompt(
+        operation=draft.operation,
+        content=draft.content,
+        timezone=draft.timezone,
+        schedule=None,
+        run_at_local=draft.run_at_local,
+        rrule=draft.rrule,
+    )
+    service = ReplyGenerationService(ollama_client=CodeFenceReplyOllama())
+    result = service.generate_confirmation_prompt(draft, fallback)
+    assert result != fallback
+    assert "确认" in result
+    assert "明天开会" in result

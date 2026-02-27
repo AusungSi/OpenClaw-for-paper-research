@@ -23,12 +23,8 @@ class FakeOllama:
         return {
             "operation": "add",
             "content": "开会",
-            "timezone": "Asia/Shanghai",
-            "schedule": "one_time",
-            "run_at_local": (self.now_local + timedelta(hours=1)).isoformat(),
-            "rrule": None,
+            "when_text": "明天早上9点",
             "confidence": 0.95,
-            "needs_confirmation": True,
             "clarification_question": None,
         }
 
@@ -92,7 +88,7 @@ def test_confirm_flow_creates_reminder(db_session):
     )
     assert total == 1
     assert reminders[0].content == "开会"
-    assert any("我理解的是下面这件事" in msg for msg in wecom.messages)
+    assert any("回复“确认”" in msg for msg in wecom.messages)
     assert any("安排好了" in msg and "北京时间" in msg for msg in wecom.messages)
 
 

@@ -15,6 +15,12 @@ class ScheduleType(str, Enum):
     RRULE = "rrule"
 
 
+class ReminderSource(str, Enum):
+    WECHAT = "wechat"
+    MOBILE_API = "mobile_api"
+    ADMIN_CHAT = "admin_chat"
+
+
 class PendingActionStatus(str, Enum):
     PENDING = "pending"
     CONFIRMED = "confirmed"

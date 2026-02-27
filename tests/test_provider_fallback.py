@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.core.config import Settings
 from app.domain.enums import OperationType
-from app.domain.schemas import IntentDraft
+from app.domain.schemas import IntentLite
 from app.llm.providers import LlmProviderError, NlgResult
 from app.services.provider_factory import build_asr_providers
 from app.services.asr_service import AsrError, AsrService, TranscriptionResult
@@ -15,7 +15,7 @@ class FailingIntentProvider:
     mode = "external"
     model = "external-model"
 
-    def parse_intent(self, text: str, timezone_name: str, context_messages: list[str]) -> IntentDraft:
+    def parse_intent(self, text: str, timezone_name: str, context_messages: list[str]) -> IntentLite:
         raise LlmProviderError("external down")
 
     def healthcheck(self):
@@ -27,16 +27,12 @@ class OkIntentProvider:
     mode = "local"
     model = "qwen3:8b"
 
-    def parse_intent(self, text: str, timezone_name: str, context_messages: list[str]) -> IntentDraft:
-        return IntentDraft(
+    def parse_intent(self, text: str, timezone_name: str, context_messages: list[str]) -> IntentLite:
+        return IntentLite(
             operation=OperationType.ADD,
             content="开会",
-            timezone=timezone_name,
-            schedule=None,
-            run_at_local=None,
-            rrule=None,
+            when_text="明天9点",
             confidence=0.9,
-            needs_confirmation=True,
             clarification_question=None,
         )
 

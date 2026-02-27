@@ -20,12 +20,8 @@ class FakeOllama:
         return {
             "operation": "add",
             "content": "语音开会",
-            "timezone": "Asia/Shanghai",
-            "schedule": "one_time",
-            "run_at_local": (self.now_local + timedelta(hours=1)).isoformat(),
-            "rrule": None,
+            "when_text": "明天早上9点",
             "confidence": 0.95,
-            "needs_confirmation": True,
             "clarification_question": None,
         }
 
