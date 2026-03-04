@@ -1,87 +1,79 @@
-# MemoMate 开发演示步骤
+# MemoMate 演示步骤（提醒 + 本地调研）
 
-本文件用于本地开发阶段快速验证“新增 -> 确认 -> 查询 -> 删除”闭环。
-
-## 1. 启动
+## 1) 启动后端与 worker
 
 ```powershell
-.\scripts\start_all.ps1
+.\scripts\start_backend.ps1
+.\scripts\start_research_worker.ps1
 ```
 
-或一键“先测再启”：
+或：
 
 ```powershell
-.\scripts\one_click_start_and_test.ps1
+.\scripts\start_all_with_worker.ps1
 ```
 
-确认后端日志包含：
+预期日志：
 
 - `Uvicorn running on http://0.0.0.0:8000`
-- `scheduler started`
+- `research_worker_started`
 
-## 2. 健康检查
+## 2) 健康检查
 
 ```powershell
 curl http://127.0.0.1:8000/api/v1/health
 ```
 
-预期响应包含以下字段：
+确认字段：
 
 - `db_ok`
-- `ollama_ok`
 - `scheduler_ok`
-- `wecom_send_ok`
-- `wecom_last_error`
-- `webhook_dedup_ok`
-- `intent_provider_ok`
-- `reply_provider_ok`
-- `asr_provider_ok`
+- `openclaw_http_ok/openclaw_http_fail`
+- `research_jobs_total`
+- `research_cache_hit/research_cache_miss`
 
-可选检查能力映射：
+## 3) 本地前端调研流程（主演示）
 
-```powershell
-curl http://127.0.0.1:8000/api/v1/capabilities
-```
+打开：
 
-## 3. 微信文本流验证
+- `http://127.0.0.1:8000/research/ui`
 
-在企业微信里向应用依次发送：
+按顺序操作：
 
-1. `明天早上9点提醒我开会`
-2. `确认`
-3. `查询`
-4. `删除 开会`
-5. `确认`
+1. 创建主题任务（如 `ultrasound report generation hallucination`）
+2. 选择方向并 `explore/start`
+3. 输入反馈并 `propose`（expand/deepen/pivot/converge）
+4. 选择候选方向进入下一轮
+5. 查看轮次树图（Topic -> Direction -> Round -> Paper）
+6. 触发 citation build（按需）并查看引文扩展图
+7. 导出 `md/bib/json`
 
-预期结果：
-
-- 收到口语化确认消息
-- 收到“安排好了”类成功消息
-- 查询能返回最近待提醒列表
-- 删除流程能完成并确认
-
-## 4. 重复回调幂等验证
-
-观察后端日志，若企业微信同一消息重试，应该出现：
-
-- `duplicate_message_ignored category=dedup ...`
-
-且不会重复创建业务动作。
-
-## 5. 微信语音流验证
-
-在企业微信里发送一段语音（60 秒以内）：
-
-预期结果：
-
-- 服务端能识别语音并进入确认流程
-- 回复文案口语化，且包含关键事实（时间/内容）
-- 回复“确认”后可创建提醒
-
-## 6. 本地无微信情况下的快速演示
+## 4) API 快速验证（可选）
 
 ```powershell
-C:\Users\lyt\anaconda3\envs\memomate\python.exe .\scripts\smoke_intent_flow.py
+curl -X POST http://127.0.0.1:8000/api/v1/research/tasks -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d "{\"topic\":\"ultrasound report generation\"}"
 ```
 
-会输出完整的模拟回复序列，便于离线演示文案风格和流程正确性。
+```powershell
+curl -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/explore/start -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d "{\"direction_index\":1}"
+```
+
+```powershell
+curl http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/explore/tree -H "Authorization: Bearer <token>"
+```
+
+## 5) 企业微信验证（轻量模式）
+
+企业微信仅验证以下能力：
+
+1. 提醒创建/确认/查询/删除
+2. `调研 状态`
+3. 返回本地前端入口链接（复杂调研不在企业微信内执行）
+
+## 6) 回归测试
+
+```powershell
+python -m pytest -q
+```
+
+期望全部通过。

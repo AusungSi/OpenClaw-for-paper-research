@@ -1,192 +1,158 @@
 # MemoMate
 
-MemoMate 是一个本地优先（Self-hosted）的企业微信智能备忘录助手。  
-你可以像聊天一样发送文字或语音，系统自动理解意图、生成待确认操作、落库并按时提醒。
+MemoMate 是本地优先的个人助手，包含两条主能力链路：
+
+1. 提醒助手（企业微信入口，轻量交互）
+2. 文献调研助手（本地前端主导，支持迭代探索）
 
 ---
 
-## 项目定位
+## 当前定位
 
-传统备忘录的问题是“录入重、提醒被动”。MemoMate 的目标是：
-
-- 低摩擦录入：通过企业微信直接说人话，不填表单
-- 本地隐私优先：后端、数据库、模型可在本机运行
-- 可替换能力层：LLM/ASR 均预留 local / external provider 切换
-- 可演示闭环：新增 -> 确认 -> 查询 -> 删除 -> 到点提醒
+- 企业微信：只承载提醒、状态通知、入口链接
+- 调研主流程：在本地 Web 前端完成（主题 -> 方向 -> 轮次探索 -> 引文扩展 -> 导出）
+- LLM 子任务：统一走 OpenClaw（意图抽取 + 调研规划/摘要）
 
 ---
 
-## 当前能力（V1）
+## 已实现能力
 
-- 企业微信双向消息：`GET /wechat` 验签，`POST /wechat` 入站处理
-- 文本提醒闭环：意图解析、二次确认、SQLite 持久化、调度推送
-- 语音转文字：优先使用企业微信 `Recognition`，否则走本地 ASR
-- 幂等去重：同一 `msg_id` 重试不会重复执行业务动作
-- Provider 抽象：Intent LLM、Reply LLM、ASR 均支持配置切换与回退
-- 可观测接口：`/api/v1/health` 与 `/api/v1/capabilities`
+### 提醒能力
+- 企业微信回调与消息处理
+- 意图抽取、确认、提醒落库与定时推送
+- 语音转写（企业微信识别优先，本地 ASR 兜底）
+
+### 调研能力（核心）
+- 任务创建、方向规划、方向检索、分页查看、导出
+- 轮次式探索（用户反馈驱动）：
+  - `explore/start`
+  - `round propose (expand/deepen/pivot/converge/stop)`
+  - `round select -> child round`
+- 全文处理：
+  - 自动下载 PDF（可用时）
+  - PyMuPDF + pdfminer 解析
+  - 解析质量分数 + 章节轻结构化
+  - 上传 PDF 补齐
+- 图谱能力：
+  - 轮次树图（Topic -> Direction -> Round -> Paper）
+  - 按需 1-hop 引文图
+  - 引文源兜底：`semantic_scholar -> openalex -> crossref`
+- 独立 research worker：
+  - DB 队列 claim / lease / heartbeat / reclaim
 
 ---
 
 ## 技术栈
 
-- Backend: FastAPI + Uvicorn
-- DB: SQLite + SQLAlchemy
-- Scheduler: APScheduler
-- WeCom SDK: wechatpy + 自定义 client
-- LLM: Ollama（默认 `qwen3:8b`）
-- ASR: faster-whisper + FFmpeg
-- Tunnel: Cloudflare Tunnel（quick 或 named）
+- Backend: FastAPI + SQLAlchemy + Alembic
+- DB: SQLite
+- Scheduler: APScheduler（提醒主用；调研可切 worker/internal）
+- LLM: OpenClaw Gateway HTTP + CLI fallback
+- PDF parsing: PyMuPDF + pdfminer.six
+- Graph: NetworkX + Cytoscape.js
 
 ---
 
-## 核心流程
+## 关键接口
 
-1. 企业微信回调进入 `/wechat`
-2. 服务快速 ACK（200），后台异步处理消息
-3. 入站消息按 `msg_id` 去重
-4. 语音消息转写为文本（Recognition 或本地 ASR）
-5. LLM 解析意图（add/query/delete/update）
-6. 写操作进入待确认状态，用户回复“确认/取消”
-7. 确认后写入提醒，APScheduler 周期扫描并触发推送
+### 调研任务
+- `POST /api/v1/research/tasks`
+- `GET /api/v1/research/tasks`
+- `GET /api/v1/research/tasks/{id}`
+- `POST /api/v1/research/tasks/{id}/plan`
+- `POST /api/v1/research/tasks/{id}/search`
+- `GET /api/v1/research/tasks/{id}/papers`
+- `GET /api/v1/research/tasks/{id}/export`
+
+### 轮次探索
+- `POST /api/v1/research/tasks/{id}/explore/start`
+- `POST /api/v1/research/tasks/{id}/explore/rounds/{round_id}/propose`
+- `POST /api/v1/research/tasks/{id}/explore/rounds/{round_id}/select`
+- `GET /api/v1/research/tasks/{id}/explore/tree`
+
+### 全文与图谱
+- `POST /api/v1/research/tasks/{id}/fulltext/build`
+- `POST /api/v1/research/tasks/{id}/fulltext/retry`
+- `GET /api/v1/research/tasks/{id}/fulltext/status`
+- `POST /api/v1/research/tasks/{id}/papers/{paper_id}/pdf/upload`
+- `POST /api/v1/research/tasks/{id}/graph/build`
+- `POST /api/v1/research/tasks/{id}/explore/rounds/{round_id}/citation/build`
+- `GET /api/v1/research/tasks/{id}/graph?view=tree|citation`
+- `GET /api/v1/research/tasks/{id}/graph/snapshots`
+- `GET /api/v1/research/tasks/{id}/graph/view`
+
+### 本地前端
+- `GET /research/ui`
 
 ---
 
-## 目录结构
+## 快速启动
 
-```text
-app/
-  api/           # wechat, mobile, health 接口
-  core/          # 配置、日志、时区
-  domain/        # 枚举、ORM 模型、schema
-  infra/         # DB 与仓储、WeCom client
-  llm/           # prompt、ollama client、provider
-  services/      # 业务服务（intent/asr/reminder/...）
-  workers/       # 调度派发
-scripts/         # 启动与隧道脚本
-tests/           # 单元与集成测试
-docs/            # 演示文档
-```
-
----
-
-## 快速开始
-
-### 1. 环境准备
-
-- Python（建议 3.10+）
-- FFmpeg（语音转写必需）
-- Ollama（本地 LLM）
-- Cloudflared（需要企业微信公网回调时）
-
-### 2. 安装依赖
+### 1) 安装
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 3. 配置环境变量
+### 2) 配置
 
 ```powershell
 copy .env.example .env
 ```
 
-至少补齐以下企业微信配置：
+建议至少配置：
 
-- `WECOM_TOKEN`
-- `WECOM_AES_KEY`
-- `WECOM_CORP_ID`
-- `WECOM_AGENT_ID`
-- `WECOM_SECRET`
+- OpenClaw：`OPENCLAW_ENABLED=true`、`OPENCLAW_BASE_URL`、`OPENCLAW_GATEWAY_TOKEN`
+- 调研：`RESEARCH_ENABLED=true`
+- 队列：`RESEARCH_QUEUE_MODE=worker`
 
-### 4. 启动方式
-
-- 一键先测再启（推荐开发态）：
-
-```powershell
-.\scripts\one_click_start_and_test.ps1
-```
-
-- 启动后端 + tunnel：
-
-```powershell
-.\scripts\start_all.ps1
-```
-
-- 仅启动后端：
+### 3) 启动后端
 
 ```powershell
 .\scripts\start_backend.ps1
 ```
 
----
-
-## 企业微信回调地址
-
-### quick tunnel（临时域名）
-
-- 每次启动 URL 都会变化，适合本地临时调试
-
-### named tunnel（固定域名）
-
-- 首次配置一次，后续 URL 稳定
-- 可使用：
+### 4) 启动 research worker（推荐）
 
 ```powershell
-.\scripts\one_click_test.ps1
+.\scripts\start_research_worker.ps1
 ```
 
-或手动：
+或一键拉起：
 
 ```powershell
-.\scripts\setup_named_tunnel.ps1 -Hostname memomate.yourdomain.com
+.\scripts\start_all_with_worker.ps1
 ```
 
 ---
 
-## API 总览
-
-- `GET /wechat` 企业微信 URL 验签
-- `POST /wechat` 企业微信消息入口（文本/语音）
-- `GET /api/v1/health` 健康检查
-- `GET /api/v1/capabilities` 当前 provider 能力映射
-- `POST /api/v1/auth/pair` 移动端配对换 token
-- `POST /api/v1/auth/refresh` 刷新 token
-- `GET/POST/PATCH/DELETE /api/v1/reminders` 提醒管理
-- `GET /api/v1/calendar` 日历视图
-- `POST /api/v1/asr/transcribe` 本地语音转文字（Bearer + multipart）
-
----
-
-## 测试与演示
-
-- 运行测试：
+## 测试
 
 ```powershell
 python -m pytest -q
 ```
 
-- 本地 smoke（不依赖企业微信）：
+---
 
-```powershell
-python .\scripts\smoke_intent_flow.py
+## 目录
+
+```text
+app/
+  api/                # wechat/mobile/health/research/research_ui
+  core/               # config/logging/timezone
+  domain/             # enums/models/schemas
+  infra/              # db/repos/wecom
+  llm/                # openclaw/ollama/providers
+  services/           # reminder + research core services
+  workers/            # dispatcher + research_worker
+scripts/              # powershell scripts
+tests/                # unit/integration tests
+docs/                 # demo and notes
 ```
 
-- 开发演示步骤见：
-
-`docs/DEMO_STEPS.md`
-
 ---
 
-## 常见问题
+## 说明
 
-- `cloudflared` 在 VSCode 终端不可用：使用 `.\cloudflared.exe` 或确认 PATH
-- `faster-whisper is not installed`：执行 `pip install -r requirements.txt`
-- 企业微信发不出消息 `errcode 60020`：检查企业可信 IP 白名单
-- `address already in use :8000`：结束占用进程或修改 `APP_PORT`
-
----
-
-## 安全说明
-
-- `.env`、数据库、缓存、`cloudflared.exe` 已在 `.gitignore` 中排除
-- 请勿把真实密钥提交到仓库
+- 当前阶段不做 OCR（`RESEARCH_OCR_ENABLED=false`）。
+- 企业微信调研命令为轻量模式（`RESEARCH_WECOM_LITE_MODE=true`），复杂操作请在本地前端完成。

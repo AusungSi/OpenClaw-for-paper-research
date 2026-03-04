@@ -7,11 +7,19 @@ from sqlalchemy.orm import Session
 from app.api.mobile import get_current_user_id
 from app.domain.schemas import (
     ResearchExportResponse,
+    ResearchExploreStartRequest,
+    ResearchExploreStartResponse,
+    ResearchExploreTreeResponse,
     ResearchFulltextBuildResponse,
     ResearchFulltextStatusResponse,
     ResearchGraphBuildRequest,
     ResearchGraphBuildResponse,
     ResearchGraphResponse,
+    ResearchGraphSnapshotListResponse,
+    ResearchRoundProposeRequest,
+    ResearchRoundProposeResponse,
+    ResearchRoundSelectRequest,
+    ResearchRoundSelectResponse,
     ResearchSearchResponse,
     ResearchTaskCreateRequest,
     ResearchTaskListResponse,
@@ -115,6 +123,102 @@ def search_direction(
     )
 
 
+@router.post("/tasks/{task_id}/explore/start", response_model=ResearchExploreStartResponse)
+def explore_start(
+    task_id: str,
+    payload: ResearchExploreStartRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchExploreStartResponse:
+    try:
+        task, round_row = research_service.start_exploration(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            direction_index=payload.direction_index,
+            top_n=payload.top_n,
+            year_from=payload.year_from,
+            year_to=payload.year_to,
+            sources=payload.sources,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchExploreStartResponse(
+        task_id=task.task_id,
+        direction_index=payload.direction_index,
+        round_id=round_row.id,
+        status=task.status.value,
+        queued=True,
+    )
+
+
+@router.post("/tasks/{task_id}/explore/rounds/{round_id}/propose", response_model=ResearchRoundProposeResponse)
+def explore_round_propose(
+    task_id: str,
+    round_id: int,
+    payload: ResearchRoundProposeRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchRoundProposeResponse:
+    try:
+        data = research_service.propose_round_candidates(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            round_id=round_id,
+            action=payload.action,
+            feedback_text=payload.feedback_text,
+            candidate_count=payload.candidate_count,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchRoundProposeResponse(**data)
+
+
+@router.post("/tasks/{task_id}/explore/rounds/{round_id}/select", response_model=ResearchRoundSelectResponse)
+def explore_round_select(
+    task_id: str,
+    round_id: int,
+    payload: ResearchRoundSelectRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchRoundSelectResponse:
+    try:
+        data = research_service.select_round_candidate(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            round_id=round_id,
+            candidate_id=payload.candidate_id,
+            top_n=payload.top_n,
+            force_refresh=payload.force_refresh,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchRoundSelectResponse(**data)
+
+
+@router.get("/tasks/{task_id}/explore/tree", response_model=ResearchExploreTreeResponse)
+def explore_tree(
+    task_id: str,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchExploreTreeResponse:
+    try:
+        data = research_service.get_exploration_tree(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchExploreTreeResponse(task_id=task_id, nodes=data["nodes"], edges=data["edges"], stats=data["stats"])
+
+
 @router.get("/tasks/{task_id}/papers", response_model=ResearchSearchResponse)
 def get_direction_papers(
     task_id: str,
@@ -173,6 +277,27 @@ def build_fulltext(
     return ResearchFulltextBuildResponse(task_id=task.task_id, status=task.status.value, queued=queued)
 
 
+@router.post("/tasks/{task_id}/fulltext/retry", response_model=ResearchFulltextBuildResponse)
+def retry_fulltext(
+    task_id: str,
+    paper_ids: list[str] | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchFulltextBuildResponse:
+    try:
+        task, queued = research_service.enqueue_fulltext_build(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            force=True,
+            paper_ids=paper_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchFulltextBuildResponse(task_id=task.task_id, status=task.status.value, queued=queued)
+
+
 @router.get("/tasks/{task_id}/fulltext/status", response_model=ResearchFulltextStatusResponse)
 def fulltext_status(
     task_id: str,
@@ -220,13 +345,20 @@ def build_graph(
     db: Session = Depends(get_db),
     research_service: ResearchService = Depends(get_research_service),
 ) -> ResearchGraphBuildResponse:
+    force_refresh = bool(force or payload.force_refresh)
     try:
         task, queued = research_service.enqueue_graph_build(
             db,
             user_id=user_id,
             task_id=task_id,
             direction_index=payload.direction_index,
-            force=force,
+            round_id=payload.round_id,
+            view=payload.view,
+            citation_sources=payload.citation_sources,
+            seed_top_n=payload.seed_top_n,
+            expand_limit_per_paper=payload.expand_limit_per_paper,
+            force_refresh=payload.force_refresh,
+            force=force_refresh,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -235,13 +367,49 @@ def build_graph(
         status=task.status.value,
         queued=queued,
         direction_index=payload.direction_index,
+        round_id=payload.round_id,
+        view=payload.view,
+    )
+
+
+@router.post("/tasks/{task_id}/explore/rounds/{round_id}/citation/build", response_model=ResearchGraphBuildResponse)
+def build_round_citation_graph(
+    task_id: str,
+    round_id: int,
+    payload: ResearchGraphBuildRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchGraphBuildResponse:
+    try:
+        task, queued = research_service.enqueue_round_citation_build(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            round_id=round_id,
+            seed_top_n=payload.seed_top_n,
+            expand_limit_per_paper=payload.expand_limit_per_paper,
+            citation_sources=payload.citation_sources,
+            force_refresh=payload.force_refresh,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchGraphBuildResponse(
+        task_id=task.task_id,
+        status=task.status.value,
+        queued=queued,
+        direction_index=payload.direction_index,
+        round_id=round_id,
+        view="citation",
     )
 
 
 @router.get("/tasks/{task_id}/graph", response_model=ResearchGraphResponse)
 def get_graph(
     task_id: str,
+    view: str = Query(default="citation"),
     direction_index: int | None = Query(default=None),
+    round_id: int | None = Query(default=None),
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
     research_service: ResearchService = Depends(get_research_service),
@@ -252,19 +420,47 @@ def get_graph(
             user_id=user_id,
             task_id=task_id,
             direction_index=direction_index,
+            round_id=round_id,
+            view=view,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ResearchGraphResponse(**data)
 
 
+@router.get("/tasks/{task_id}/graph/snapshots", response_model=ResearchGraphSnapshotListResponse)
+def list_graph_snapshots(
+    task_id: str,
+    view: str | None = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=50),
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchGraphSnapshotListResponse:
+    try:
+        data = research_service.list_graph_snapshots(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            view=view,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchGraphSnapshotListResponse(**data)
+
+
 @router.get("/tasks/{task_id}/graph/view", response_class=HTMLResponse)
 def graph_view(
     task_id: str,
+    view: str = Query(default="citation"),
     direction_index: int | None = Query(default=None),
+    round_id: int | None = Query(default=None),
     _user_id: int = Depends(get_current_user_id),
 ) -> HTMLResponse:
     direction_q = f"&direction_index={direction_index}" if direction_index is not None else ""
+    round_q = f"&round_id={round_id}" if round_id is not None else ""
+    view_q = f"&view={view}"
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -306,7 +502,7 @@ def graph_view(
   </div>
   <script>
     const token = localStorage.getItem("memomate_access_token") || "";
-    const api = `/api/v1/research/tasks/{task_id}/graph?` + `t=${{Date.now()}}{direction_q}`;
+    const api = `/api/v1/research/tasks/{task_id}/graph?` + `t=${{Date.now()}}{view_q}{direction_q}{round_q}`;
     fetch(api, {{ headers: token ? {{ Authorization: `Bearer ${{token}}` }} : {{}} }})
       .then(r => r.json())
       .then(data => {{

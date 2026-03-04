@@ -86,3 +86,24 @@ class ResearchGraphBuildStatus(str, Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+
+
+class ResearchActionType(str, Enum):
+    EXPAND = "expand"
+    DEEPEN = "deepen"
+    PIVOT = "pivot"
+    CONVERGE = "converge"
+    STOP = "stop"
+
+
+class ResearchRoundStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+class ResearchGraphViewType(str, Enum):
+    TREE = "tree"
+    CITATION = "citation"

@@ -83,6 +83,29 @@ class ResearchCommandService:
             self._send("\n".join(lines), wecom_user_id, reply_sink)
             return True
 
+        if self.settings.research_wecom_lite_mode:
+            m_graph_view = re.match(r"^调研\s*图谱\s*查看(?:\s+方向\s*(\d+))?$", normalized)
+            if m_graph_view:
+                task = self.research_service.get_active_task(db, user_id)
+                if not task:
+                    self._send("你还没有调研任务。先发：调研 主题：xxx", wecom_user_id, reply_sink)
+                    return True
+                direction_index = int(m_graph_view.group(1)) if m_graph_view.group(1) else None
+                url = self._graph_view_url(task.task_id, direction_index)
+                self._send(f"图谱链接：{url}", wecom_user_id, reply_sink)
+                return True
+
+            active = self.research_service.get_active_task(db, user_id)
+            task_id = active.task_id if active else None
+            ui_url = self._research_ui_url(task_id=task_id)
+            self._send(
+                "企业微信仅保留提醒与状态能力。复杂调研操作请在本地前端完成：\n"
+                f"{ui_url}",
+                wecom_user_id,
+                reply_sink,
+            )
+            return True
+
         if normalized == "调研 全文 构建":
             task = self.research_service.get_active_task(db, user_id)
             if not task:
@@ -348,17 +371,8 @@ class ResearchCommandService:
             "调研命令：\n"
             "1) 调研 主题：{topic} 年份：2021-2026 领域：xxx 数量：20 来源：semantic_scholar|arxiv\n"
             "2) 调研 状态\n"
-            "3) 调研 任务 列表\n"
-            "4) 调研 任务 切换 {task_id}\n"
-            "5) 调研 选择 {k}\n"
-            "6) 调研 检索 {k} 数量：30\n"
-            "7) 调研 重新检索 {k} 数量：30\n"
-            "8) 调研 下一页 / 调研 上一页\n"
-            "9) 调研 论文 {index} / 调研 doi {doi}\n"
-            "10) 调研 导出 / 调研 导出 格式：bib|md|json\n"
-            "11) 调研 全文 构建 / 调研 全文 状态\n"
-            "12) 调研 图谱 构建 [方向 k] / 调研 图谱 查看 [方向 k]\n"
-            "13) 调研 上传PDF {paper_index}"
+            "3) 调研 图谱 查看 [方向 k]\n"
+            "4) 复杂调研流程请在本地前端完成（企业微信仅保留提醒与状态）"
         )
 
     @staticmethod
@@ -485,3 +499,16 @@ class ResearchCommandService:
         if direction_index is None:
             return base
         return f"{base}?direction_index={direction_index}"
+
+    def _research_ui_url(self, *, task_id: str | None) -> str:
+        base_cfg = (self.settings.research_web_base_url or "").strip().rstrip("/")
+        if base_cfg:
+            base = f"{base_cfg}/research/ui"
+        else:
+            host = self.settings.app_host
+            if host in {"0.0.0.0", "::"}:
+                host = "127.0.0.1"
+            base = f"http://{host}:{self.settings.app_port}/research/ui"
+        if not task_id:
+            return base
+        return f"{base}?task_id={task_id}"

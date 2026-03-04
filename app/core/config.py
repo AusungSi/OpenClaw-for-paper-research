@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     research_job_interval_seconds: int = 20
     research_job_max_attempts: int = 3
     research_job_backoff_seconds: int = 10
+    research_queue_mode: str = "worker"
+    research_queue_name: str = "research"
+    research_worker_poll_seconds: int = 2
+    research_worker_concurrency: int = 2
+    research_job_lease_seconds: int = 120
+    research_job_heartbeat_seconds: int = 15
     research_direction_min: int = 3
     research_direction_max: int = 8
     research_topn_default: int = 20
@@ -107,6 +113,15 @@ class Settings(BaseSettings):
     research_graph_seed_topn: int = 20
     research_graph_expand_limit_per_paper: int = 30
     research_graph_viz_enabled: bool = True
+    research_exploration_enabled: bool = True
+    research_max_rounds: int = 10
+    research_round_candidate_default: int = 4
+    research_citation_sources_default: str = "semantic_scholar,openalex,crossref"
+    research_citation_on_demand_only: bool = True
+    research_citation_cache_ttl_seconds: int = 86400
+    research_wecom_lite_mode: bool = True
+    research_web_base_url: str = ""
+    research_ocr_enabled: bool = False
     semantic_scholar_api_key: str = ""
 
 

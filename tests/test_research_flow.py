@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.core.config import get_settings
-from app.domain.enums import ResearchJobStatus
+from app.domain.enums import ResearchJobStatus, ResearchJobType
 import orjson
 
 from app.domain.models import ResearchJob
@@ -68,7 +68,9 @@ def test_research_planner_contract():
 def test_research_flow_create_plan_search_and_select(db_session):
     settings = get_settings()
     original_research_enabled = settings.research_enabled
+    original_lite_mode = settings.research_wecom_lite_mode
     settings.research_enabled = True
+    settings.research_wecom_lite_mode = False
 
     try:
         wecom = FakeWeCom()
@@ -146,6 +148,7 @@ def test_research_flow_create_plan_search_and_select(db_session):
         assert "Reducing Hallucination" in captured[0]
     finally:
         settings.research_enabled = original_research_enabled
+        settings.research_wecom_lite_mode = original_lite_mode
 
 
 def test_research_job_retry_then_fail(db_session):
@@ -192,6 +195,41 @@ def test_research_job_retry_then_fail(db_session):
     finally:
         settings.research_job_max_attempts = original_max_attempts
         settings.research_job_backoff_seconds = original_backoff
+
+
+def test_research_job_claim_and_reclaim(db_session):
+    service = ResearchService(openclaw_client=FakeOpenClawClient(), wecom_client=None)
+    user = UserRepo(db_session).get_or_create("research-worker-user", timezone_name="Asia/Shanghai")
+    task = service.create_task(
+        db_session,
+        user_id=user.id,
+        topic="worker queue topic",
+        constraints={},
+    )
+    job_repo = ResearchJobRepo(db_session)
+    plan_job = job_repo.latest_for_task(task.id)
+    assert plan_job is not None
+    plan_job.status = ResearchJobStatus.DONE
+    db_session.add(plan_job)
+    db_session.flush()
+
+    queued = job_repo.enqueue(task.id, ResearchJobType.SEARCH, {"direction_index": 1}, queue_name="research")
+    assert queued.status == ResearchJobStatus.QUEUED
+
+    first = job_repo.claim_next(worker_id="worker-a", lease_seconds=1, queue_name="research")
+    assert first is not None
+    assert first.status == ResearchJobStatus.RUNNING
+    assert first.worker_id == "worker-a"
+
+    first.lease_until = datetime.now(timezone.utc) - timedelta(seconds=2)
+    db_session.add(first)
+    db_session.flush()
+
+    second = job_repo.claim_next(worker_id="worker-b", lease_seconds=30, queue_name="research")
+    assert second is not None
+    assert second.id == first.id
+    assert second.worker_id == "worker-b"
+    assert second.attempts >= 2
 
 
 def test_research_command_topic_with_constraints(db_session):
@@ -331,8 +369,10 @@ def test_research_export_file_fallback_to_text_path(db_session):
     settings = get_settings()
     original_research_enabled = settings.research_enabled
     original_export_send_file = settings.research_export_send_file
+    original_lite_mode = settings.research_wecom_lite_mode
     settings.research_enabled = True
     settings.research_export_send_file = True
+    settings.research_wecom_lite_mode = False
     try:
         wecom = FakeWeCom()
         wecom.file_fail = True
@@ -387,12 +427,15 @@ def test_research_export_file_fallback_to_text_path(db_session):
     finally:
         settings.research_enabled = original_research_enabled
         settings.research_export_send_file = original_export_send_file
+        settings.research_wecom_lite_mode = original_lite_mode
 
 
 def test_research_command_fulltext_and_graph_commands(db_session):
     settings = get_settings()
     original_research_enabled = settings.research_enabled
+    original_lite_mode = settings.research_wecom_lite_mode
     settings.research_enabled = True
+    settings.research_wecom_lite_mode = False
     try:
         wecom = FakeWeCom()
         service = ResearchService(openclaw_client=FakeOpenClawClient(), wecom_client=wecom)
@@ -474,3 +517,4 @@ def test_research_command_fulltext_and_graph_commands(db_session):
         assert task.task_id in captured[-1]
     finally:
         settings.research_enabled = original_research_enabled
+        settings.research_wecom_lite_mode = original_lite_mode

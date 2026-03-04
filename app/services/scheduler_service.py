@@ -31,7 +31,11 @@ class SchedulerService:
             max_instances=1,
             coalesce=True,
         )
-        if self.research_service and self.settings.research_enabled:
+        if (
+            self.research_service
+            and self.settings.research_enabled
+            and self.settings.research_queue_mode.strip().lower() == "internal"
+        ):
             self.scheduler.add_job(
                 self.run_research_cycle,
                 "interval",
@@ -43,7 +47,11 @@ class SchedulerService:
         self.scheduler.start()
         self.started = True
         await self.run_dispatch_cycle()
-        if self.research_service and self.settings.research_enabled:
+        if (
+            self.research_service
+            and self.settings.research_enabled
+            and self.settings.research_queue_mode.strip().lower() == "internal"
+        ):
             await self.run_research_cycle()
         logger.info("scheduler started")
 

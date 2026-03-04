@@ -402,6 +402,9 @@ class ResearchFulltextItem(BaseModel):
     pdf_path: str | None = None
     text_path: str | None = None
     text_chars: int = 0
+    parser: str | None = None
+    quality_score: float | None = None
+    sections: dict = Field(default_factory=dict)
     fail_reason: str | None = None
     fetched_at: datetime | None = None
     parsed_at: datetime | None = None
@@ -415,6 +418,12 @@ class ResearchFulltextStatusResponse(BaseModel):
 
 class ResearchGraphBuildRequest(BaseModel):
     direction_index: int | None = None
+    round_id: int | None = None
+    view: str = "citation"
+    citation_sources: list[str] | None = None
+    seed_top_n: int | None = None
+    expand_limit_per_paper: int | None = None
+    force_refresh: bool = False
 
 
 class ResearchGraphBuildResponse(BaseModel):
@@ -422,6 +431,8 @@ class ResearchGraphBuildResponse(BaseModel):
     status: str
     queued: bool = True
     direction_index: int | None = None
+    round_id: int | None = None
+    view: str = "citation"
 
 
 class ResearchGraphNode(BaseModel):
@@ -433,6 +444,9 @@ class ResearchGraphNode(BaseModel):
     direction_index: int | None = None
     score: float | None = None
     fulltext_status: str | None = None
+    depth: int | None = None
+    action: str | None = None
+    status: str | None = None
 
 
 class ResearchGraphEdge(BaseModel):
@@ -444,9 +458,85 @@ class ResearchGraphEdge(BaseModel):
 
 class ResearchGraphResponse(BaseModel):
     task_id: str
+    view: str = "citation"
     direction_index: int | None = None
+    round_id: int | None = None
     depth: int = 1
     status: str
+    nodes: list[ResearchGraphNode] = Field(default_factory=list)
+    edges: list[ResearchGraphEdge] = Field(default_factory=list)
+    stats: dict = Field(default_factory=dict)
+
+
+class ResearchGraphSnapshotItem(BaseModel):
+    snapshot_id: int
+    direction_index: int | None = None
+    round_id: int | None = None
+    view: str
+    status: str
+    nodes: int
+    edges: int
+    updated_at: datetime
+
+
+class ResearchGraphSnapshotListResponse(BaseModel):
+    task_id: str
+    items: list[ResearchGraphSnapshotItem] = Field(default_factory=list)
+
+
+class ResearchExploreStartRequest(BaseModel):
+    direction_index: int
+    top_n: int | None = None
+    year_from: int | None = None
+    year_to: int | None = None
+    sources: list[str] | None = None
+
+
+class ResearchExploreStartResponse(BaseModel):
+    task_id: str
+    direction_index: int
+    round_id: int
+    status: str
+    queued: bool = True
+
+
+class ResearchRoundCandidateItem(BaseModel):
+    candidate_id: int
+    candidate_index: int
+    name: str
+    queries: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
+class ResearchRoundProposeRequest(BaseModel):
+    action: str
+    feedback_text: str = ""
+    candidate_count: int = 4
+
+
+class ResearchRoundProposeResponse(BaseModel):
+    task_id: str
+    round_id: int
+    action: str
+    candidates: list[ResearchRoundCandidateItem] = Field(default_factory=list)
+
+
+class ResearchRoundSelectRequest(BaseModel):
+    candidate_id: int
+    top_n: int | None = None
+    force_refresh: bool = False
+
+
+class ResearchRoundSelectResponse(BaseModel):
+    task_id: str
+    parent_round_id: int
+    child_round_id: int
+    status: str
+    queued: bool = True
+
+
+class ResearchExploreTreeResponse(BaseModel):
+    task_id: str
     nodes: list[ResearchGraphNode] = Field(default_factory=list)
     edges: list[ResearchGraphEdge] = Field(default_factory=list)
     stats: dict = Field(default_factory=dict)
@@ -480,6 +570,7 @@ class ResearchTaskResponse(BaseModel):
     constraints: dict = Field(default_factory=dict)
     directions: list[ResearchDirectionItem] = Field(default_factory=list)
     papers_total: int = 0
+    rounds_total: int = 0
     last_job_type: str | None = None
     last_job_status: str | None = None
     last_failure_reason: str | None = None

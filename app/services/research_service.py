@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -17,19 +18,26 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.domain.enums import (
+    ResearchActionType,
     ResearchGraphBuildStatus,
+    ResearchGraphViewType,
     ResearchJobType,
     ResearchPaperFulltextStatus,
+    ResearchRoundStatus,
     ResearchTaskStatus,
 )
-from app.domain.models import ResearchTask, User
+from app.domain.models import ResearchRound, ResearchTask, User
 from app.infra.repos import (
+    ResearchCitationFetchCacheRepo,
     ResearchCitationEdgeRepo,
     ResearchDirectionRepo,
     ResearchGraphSnapshotRepo,
     ResearchJobRepo,
     ResearchPaperRepo,
     ResearchPaperFulltextRepo,
+    ResearchRoundCandidateRepo,
+    ResearchRoundPaperRepo,
+    ResearchRoundRepo,
     ResearchSearchCacheRepo,
     ResearchSessionRepo,
     ResearchTaskRepo,
@@ -119,6 +127,7 @@ class ResearchService:
             row.id,
             ResearchJobType.PLAN,
             {"topic": row.topic, "constraints": constraints or {}},
+            queue_name=self.settings.research_queue_name,
         )
         session = session_repo.get_or_create(user_id, page_size=self.settings.research_page_size)
         session_repo.set_active_task(session, row.task_id)
@@ -143,7 +152,7 @@ class ResearchService:
             "top_n": top_n or self.settings.research_topn_default,
             "force_refresh": bool(force_refresh),
         }
-        ResearchJobRepo(db).enqueue(task.id, ResearchJobType.SEARCH, payload)
+        ResearchJobRepo(db).enqueue(task.id, ResearchJobType.SEARCH, payload, queue_name=self.settings.research_queue_name)
         task.status = ResearchTaskStatus.SEARCHING
         task.updated_at = datetime.now(timezone.utc)
         db.add(task)
@@ -162,7 +171,7 @@ class ResearchService:
             "topic": task.topic,
             "constraints": _load_json_dict(task.constraints_json),
         }
-        job_repo.enqueue(task.id, ResearchJobType.PLAN, payload)
+        job_repo.enqueue(task.id, ResearchJobType.PLAN, payload, queue_name=self.settings.research_queue_name)
         task.status = ResearchTaskStatus.PLANNING
         task.updated_at = datetime.now(timezone.utc)
         db.add(task)
@@ -176,6 +185,7 @@ class ResearchService:
         user_id: int,
         task_id: str,
         force: bool = False,
+        paper_ids: list[str] | None = None,
     ) -> tuple[ResearchTask, bool]:
         task = self.switch_task(db, user_id=user_id, task_id=task_id)
         if not self.settings.research_fulltext_enabled:
@@ -183,7 +193,12 @@ class ResearchService:
         job_repo = ResearchJobRepo(db)
         if not force and job_repo.has_pending(task.id, ResearchJobType.FULLTEXT):
             return task, False
-        job_repo.enqueue(task.id, ResearchJobType.FULLTEXT, {"force": bool(force)})
+        job_repo.enqueue(
+            task.id,
+            ResearchJobType.FULLTEXT,
+            {"force": bool(force), "paper_ids": [str(x).strip() for x in (paper_ids or []) if str(x).strip()]},
+            queue_name=self.settings.research_queue_name,
+        )
         task.status = ResearchTaskStatus.SEARCHING
         task.updated_at = datetime.now(timezone.utc)
         db.add(task)
@@ -197,6 +212,12 @@ class ResearchService:
         user_id: int,
         task_id: str,
         direction_index: int | None = None,
+        round_id: int | None = None,
+        view: str = ResearchGraphViewType.CITATION.value,
+        citation_sources: list[str] | None = None,
+        seed_top_n: int | None = None,
+        expand_limit_per_paper: int | None = None,
+        force_refresh: bool = False,
         force: bool = False,
     ) -> tuple[ResearchTask, bool]:
         task = self.switch_task(db, user_id=user_id, task_id=task_id)
@@ -205,17 +226,281 @@ class ResearchService:
         job_repo = ResearchJobRepo(db)
         if not force and job_repo.has_pending(task.id, ResearchJobType.GRAPH_BUILD):
             return task, False
-        payload = {"direction_index": direction_index, "force": bool(force)}
-        job_repo.enqueue(task.id, ResearchJobType.GRAPH_BUILD, payload)
+        payload = {
+            "direction_index": direction_index,
+            "round_id": round_id,
+            "view": (view or ResearchGraphViewType.CITATION.value).strip().lower(),
+            "citation_sources": citation_sources,
+            "seed_top_n": seed_top_n,
+            "expand_limit_per_paper": expand_limit_per_paper,
+            "force": bool(force),
+            "force_refresh": bool(force_refresh),
+        }
+        job_repo.enqueue(task.id, ResearchJobType.GRAPH_BUILD, payload, queue_name=self.settings.research_queue_name)
         task.status = ResearchTaskStatus.SEARCHING
         task.updated_at = datetime.now(timezone.utc)
         db.add(task)
         db.flush()
         return task, True
 
-    def process_one_job(self, db: Session) -> int:
+    def start_exploration(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        direction_index: int,
+        top_n: int | None = None,
+        year_from: int | None = None,
+        year_to: int | None = None,
+        sources: list[str] | None = None,
+    ) -> tuple[ResearchTask, ResearchRound]:
+        if not self.settings.research_exploration_enabled:
+            raise ValueError("research exploration is disabled")
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        direction = ResearchDirectionRepo(db).get_by_index(task.id, direction_index)
+        if not direction:
+            raise ValueError("direction not found")
+
+        round_repo = ResearchRoundRepo(db)
+        max_rounds = max(1, int(self.settings.research_max_rounds))
+        if round_repo.count_for_task_direction(task.id, direction_index) >= max_rounds:
+            raise ValueError(f"max rounds reached ({max_rounds})")
+
+        query_terms = _load_json_list(direction.queries_json) or [direction.name]
+        round_row = round_repo.create(
+            task_id=task.id,
+            direction_index=direction_index,
+            parent_round_id=None,
+            depth=1,
+            action=ResearchActionType.EXPAND.value,
+            feedback_text=None,
+            query_terms=query_terms[:4],
+            status=ResearchRoundStatus.QUEUED.value,
+        )
+        payload = {
+            "direction_index": direction_index,
+            "top_n": top_n or self.settings.research_topn_default,
+            "force_refresh": False,
+            "round_id": round_row.id,
+            "explicit_queries": query_terms[:4],
+            "constraints_override": {
+                "year_from": year_from,
+                "year_to": year_to,
+                "sources": sources,
+            },
+        }
+        ResearchJobRepo(db).enqueue(task.id, ResearchJobType.SEARCH, payload, queue_name=self.settings.research_queue_name)
+        task.status = ResearchTaskStatus.SEARCHING
+        task.updated_at = datetime.now(timezone.utc)
+        db.add(task)
+        db.flush()
+        return task, round_row
+
+    def propose_round_candidates(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        round_id: int,
+        action: str,
+        feedback_text: str,
+        candidate_count: int | None = None,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        round_repo = ResearchRoundRepo(db)
+        round_row = round_repo.get(round_id)
+        if not round_row or round_row.task_id != task.id:
+            raise ValueError("round not found")
+        action_norm = (action or "").strip().lower()
+        valid_actions = {item.value for item in ResearchActionType}
+        if action_norm not in valid_actions:
+            raise ValueError("invalid action")
+        if action_norm == ResearchActionType.STOP.value:
+            round_repo.update_status(round_row, ResearchRoundStatus.STOPPED.value)
+            return {"task_id": task.task_id, "round_id": round_id, "action": action_norm, "candidates": []}
+
+        candidate_n = max(2, min(5, int(candidate_count or self.settings.research_round_candidate_default)))
+        references = self._round_reference_titles(db, round_id=round_row.id, limit=8)
+        generated = self._generate_round_candidates(
+            task_topic=task.topic,
+            action=action_norm,
+            feedback_text=feedback_text,
+            query_terms=_load_json_list(round_row.query_terms_json),
+            references=references,
+            candidate_count=candidate_n,
+        )
+        repo = ResearchRoundCandidateRepo(db)
+        rows = repo.replace_for_round(round_row.id, generated)
+        out = []
+        for row in rows:
+            out.append(
+                {
+                    "candidate_id": row.id,
+                    "candidate_index": row.candidate_index,
+                    "name": row.name,
+                    "queries": _load_json_list(row.queries_json),
+                    "reason": row.reason,
+                }
+            )
+        round_row.action = ResearchActionType(action_norm)
+        round_row.feedback_text = (feedback_text or "").strip()[:2000] or None
+        round_row.updated_at = datetime.now(timezone.utc)
+        db.add(round_row)
+        db.flush()
+        return {"task_id": task.task_id, "round_id": round_row.id, "action": action_norm, "candidates": out}
+
+    def select_round_candidate(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        round_id: int,
+        candidate_id: int,
+        top_n: int | None = None,
+        force_refresh: bool = False,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        round_repo = ResearchRoundRepo(db)
+        parent = round_repo.get(round_id)
+        if not parent or parent.task_id != task.id:
+            raise ValueError("round not found")
+        candidate_repo = ResearchRoundCandidateRepo(db)
+        candidate = candidate_repo.get_by_id(candidate_id)
+        if not candidate or candidate.round_id != parent.id:
+            fallback = candidate_repo.get_by_index(parent.id, candidate_id)
+            if not fallback:
+                raise ValueError("candidate not found")
+            candidate = fallback
+        candidate_repo.mark_selected(candidate)
+
+        max_rounds = max(1, int(self.settings.research_max_rounds))
+        if parent.depth >= max_rounds:
+            raise ValueError(f"max rounds reached ({max_rounds})")
+        child = round_repo.create(
+            task_id=task.id,
+            direction_index=parent.direction_index,
+            parent_round_id=parent.id,
+            depth=parent.depth + 1,
+            action=parent.action.value,
+            feedback_text=parent.feedback_text,
+            query_terms=_load_json_list(candidate.queries_json),
+            status=ResearchRoundStatus.QUEUED.value,
+        )
+        payload = {
+            "direction_index": parent.direction_index,
+            "top_n": top_n or self.settings.research_topn_default,
+            "force_refresh": bool(force_refresh),
+            "round_id": child.id,
+            "explicit_queries": _load_json_list(candidate.queries_json),
+        }
+        ResearchJobRepo(db).enqueue(task.id, ResearchJobType.SEARCH, payload, queue_name=self.settings.research_queue_name)
+        task.status = ResearchTaskStatus.SEARCHING
+        task.updated_at = datetime.now(timezone.utc)
+        db.add(task)
+        db.flush()
+        return {
+            "task_id": task.task_id,
+            "parent_round_id": parent.id,
+            "child_round_id": child.id,
+            "status": task.status.value,
+            "queued": True,
+        }
+
+    def enqueue_round_citation_build(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        round_id: int,
+        seed_top_n: int | None = None,
+        expand_limit_per_paper: int | None = None,
+        citation_sources: list[str] | None = None,
+        force_refresh: bool = False,
+    ) -> tuple[ResearchTask, bool]:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        round_row = ResearchRoundRepo(db).get(round_id)
+        if not round_row or round_row.task_id != task.id:
+            raise ValueError("round not found")
         job_repo = ResearchJobRepo(db)
-        job = job_repo.next_queued()
+        if not force_refresh and job_repo.has_pending(task.id, ResearchJobType.GRAPH_BUILD):
+            return task, False
+        payload = {
+            "round_id": round_id,
+            "direction_index": round_row.direction_index,
+            "view": ResearchGraphViewType.CITATION.value,
+            "seed_top_n": seed_top_n,
+            "expand_limit_per_paper": expand_limit_per_paper,
+            "citation_sources": citation_sources,
+            "force_refresh": bool(force_refresh),
+        }
+        job_repo.enqueue(task.id, ResearchJobType.GRAPH_BUILD, payload, queue_name=self.settings.research_queue_name)
+        task.status = ResearchTaskStatus.SEARCHING
+        task.updated_at = datetime.now(timezone.utc)
+        db.add(task)
+        db.flush()
+        return task, True
+
+    def get_exploration_tree(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        return self._build_tree_graph(db, task)
+
+    def list_graph_snapshots(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        view: str | None = None,
+        limit: int = 10,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        rows = ResearchGraphSnapshotRepo(db).list_recent(task.id, view_type=view, limit=limit)
+        items = []
+        for row in rows:
+            nodes = _load_json_list_of_dict(row.nodes_json)
+            edges = _load_json_list_of_dict(row.edges_json)
+            items.append(
+                {
+                    "snapshot_id": row.id,
+                    "direction_index": row.direction_index,
+                    "round_id": row.round_id,
+                    "view": row.view_type.value,
+                    "status": row.status.value,
+                    "nodes": len(nodes),
+                    "edges": len(edges),
+                    "updated_at": row.updated_at,
+                }
+            )
+        return {"task_id": task.task_id, "items": items}
+
+    def process_one_job(
+        self,
+        db: Session,
+        *,
+        worker_id: str | None = None,
+        queue_name: str | None = None,
+        lease_seconds: int | None = None,
+    ) -> int:
+        job_repo = ResearchJobRepo(db)
+        queue = (queue_name or self.settings.research_queue_name).strip() or "research"
+        if worker_id:
+            job = job_repo.claim_next(
+                worker_id=worker_id,
+                lease_seconds=int(lease_seconds or self.settings.research_job_lease_seconds),
+                queue_name=queue,
+            )
+        else:
+            job = job_repo.next_queued(queue_name=queue)
         if not job:
             return 0
         started_at = perf_counter()
@@ -230,17 +515,35 @@ class ResearchService:
         except Exception:
             payload = {}
 
-        job_repo.mark_running(job)
+        if not worker_id:
+            job_repo.mark_running(job)
+
+        last_beat = perf_counter()
+
+        def touch_lease() -> None:
+            nonlocal last_beat
+            if not worker_id:
+                return
+            hb_interval = max(3, int(self.settings.research_job_heartbeat_seconds))
+            if perf_counter() - last_beat < hb_interval:
+                return
+            job_repo.heartbeat(
+                job,
+                worker_id=worker_id,
+                lease_seconds=int(lease_seconds or self.settings.research_job_lease_seconds),
+            )
+            last_beat = perf_counter()
+
         job_error: str | None = None
         try:
             if job.job_type == ResearchJobType.PLAN:
-                self._run_plan_job(db, task, payload)
+                self._run_plan_job(db, task, payload, touch_lease=touch_lease)
             elif job.job_type == ResearchJobType.SEARCH:
-                self._run_search_job(db, task, payload)
+                self._run_search_job(db, task, payload, touch_lease=touch_lease)
             elif job.job_type == ResearchJobType.FULLTEXT:
-                self._run_fulltext_job(db, task, payload)
+                self._run_fulltext_job(db, task, payload, touch_lease=touch_lease)
             elif job.job_type == ResearchJobType.GRAPH_BUILD:
-                self._run_graph_job(db, task, payload)
+                self._run_graph_job(db, task, payload, touch_lease=touch_lease)
             else:
                 raise ValueError(f"unsupported job type: {job.job_type}")
             job_repo.mark_done(job)
@@ -324,6 +627,9 @@ class ResearchService:
                     "pdf_path": row.pdf_path,
                     "text_path": row.text_path,
                     "text_chars": row.text_chars,
+                    "parser": row.parser,
+                    "quality_score": row.quality_score,
+                    "sections": _load_json_dict(row.sections_json),
                     "fail_reason": row.fail_reason,
                     "fetched_at": row.fetched_at,
                     "parsed_at": row.parsed_at,
@@ -359,7 +665,9 @@ class ResearchService:
             safe_name = f"{safe_name}.pdf"
         pdf_path = pdf_dir / safe_name
         pdf_path.write_bytes(content)
-        text, _meta = self._parse_pdf_bytes(content)
+        text, meta = self._parse_pdf_bytes(content)
+        sections = _extract_sections_lite(text)
+        quality = _estimate_text_quality(text)
         text_path = pdf_dir / f"{safe_name.rsplit('.', 1)[0]}.txt"
         text_path.write_text(text, encoding="utf-8")
         row = ResearchPaperFulltextRepo(db).upsert(
@@ -370,6 +678,9 @@ class ResearchService:
             pdf_path=str(pdf_path),
             text_path=str(text_path),
             text_chars=len(text),
+            parser=str(meta.get("parser") or "")[:32] or None,
+            quality_score=quality,
+            sections_json=orjson.dumps(sections).decode("utf-8"),
             fail_reason=None,
             fetched_at=datetime.now(timezone.utc),
             parsed_at=datetime.now(timezone.utc),
@@ -389,13 +700,26 @@ class ResearchService:
         user_id: int,
         task_id: str,
         direction_index: int | None = None,
+        round_id: int | None = None,
+        view: str = ResearchGraphViewType.CITATION.value,
     ) -> dict:
         task = self.switch_task(db, user_id=user_id, task_id=task_id)
-        row = ResearchGraphSnapshotRepo(db).latest_for_task(task.id, direction_index=direction_index)
+        view_norm = (view or ResearchGraphViewType.CITATION.value).strip().lower()
+        if view_norm == ResearchGraphViewType.TREE.value:
+            data = self._build_tree_graph(db, task)
+            return {"task_id": task.task_id, "view": view_norm, **data}
+        row = ResearchGraphSnapshotRepo(db).latest_for_task(
+            task.id,
+            direction_index=direction_index,
+            round_id=round_id,
+            view_type=view_norm,
+        )
         if not row:
             return {
                 "task_id": task.task_id,
+                "view": view_norm,
                 "direction_index": direction_index,
+                "round_id": round_id,
                 "depth": int(self.settings.research_graph_depth_default),
                 "status": ResearchGraphBuildStatus.QUEUED.value,
                 "nodes": [],
@@ -404,7 +728,9 @@ class ResearchService:
             }
         return {
             "task_id": task.task_id,
+            "view": row.view_type.value,
             "direction_index": row.direction_index,
+            "round_id": row.round_id,
             "depth": row.depth,
             "status": row.status.value,
             "nodes": _load_json_list_of_dict(row.nodes_json),
@@ -537,7 +863,14 @@ class ResearchService:
             self._record_export_metric(success=False)
             raise
 
-    def _run_plan_job(self, db: Session, task: ResearchTask, payload: dict) -> None:
+    def _run_plan_job(
+        self,
+        db: Session,
+        task: ResearchTask,
+        payload: dict,
+        *,
+        touch_lease: Callable[[], None] | None = None,
+    ) -> None:
         constraints = _load_json_dict(task.constraints_json)
         directions = self._plan_directions(task.topic, constraints)
         ResearchDirectionRepo(db).replace_for_task(task, directions)
@@ -549,11 +882,27 @@ class ResearchService:
         for idx, item in enumerate(directions, start=1):
             lines.append(f"{idx}. {item['name']}")
         lines.append('回复“调研 选择 2”查看方向 2。')
+        if touch_lease:
+            touch_lease()
         self._notify_user(db, task.user_id, "\n".join(lines))
 
-    def _run_search_job(self, db: Session, task: ResearchTask, payload: dict) -> None:
+    def _run_search_job(
+        self,
+        db: Session,
+        task: ResearchTask,
+        payload: dict,
+        *,
+        touch_lease: Callable[[], None] | None = None,
+    ) -> None:
         constraints = _load_json_dict(task.constraints_json)
+        constraints_override = payload.get("constraints_override")
+        if isinstance(constraints_override, dict):
+            for key in ("year_from", "year_to", "sources"):
+                value = constraints_override.get(key)
+                if value:
+                    constraints[key] = value
         direction_index = int(payload.get("direction_index") or 1)
+        round_id = _to_int_or_none(payload.get("round_id"))
         default_top_n = int(constraints.get("top_n") or self.settings.research_topn_default)
         top_n = int(payload.get("top_n") or default_top_n)
         force_refresh = bool(payload.get("force_refresh") or False)
@@ -566,7 +915,15 @@ class ResearchService:
         if not allowed_sources:
             allowed_sources = {"semantic_scholar"}
 
-        query_terms = _load_json_list(direction.queries_json) or [direction.name]
+        query_terms = _load_json_list(payload.get("explicit_queries") or "[]")
+        if not query_terms and round_id:
+            round_row = ResearchRoundRepo(db).get(round_id)
+            if round_row and round_row.task_id == task.id:
+                query_terms = _load_json_list(round_row.query_terms_json)
+                ResearchRoundRepo(db).update_status(round_row, ResearchRoundStatus.RUNNING.value)
+        if not query_terms:
+            query_terms = _load_json_list(direction.queries_json) or [direction.name]
+
         exclude_terms = _load_json_list(direction.exclude_terms_json)
         all_papers: list[dict] = []
         cache_repo = ResearchSearchCacheRepo(db)
@@ -595,31 +952,55 @@ class ResearchService:
                         result.error,
                     )
                 all_papers.extend(result.papers)
+                if touch_lease:
+                    touch_lease()
         papers = self._dedupe_papers(all_papers)
         papers = papers[: max(1, top_n)]
         for row in papers:
             row["method_summary"] = self._summarize_method(row.get("abstract") or "")
-        rows = ResearchPaperRepo(db).replace_direction_papers(direction, papers)
-        ResearchDirectionRepo(db).update_papers_count(direction, len(rows))
+
+        paper_repo = ResearchPaperRepo(db)
+        if round_id:
+            rows = paper_repo.upsert_direction_papers(direction, papers)
+            ResearchRoundPaperRepo(db).replace_for_round(round_id=round_id, rows=rows, role="seed")
+            round_row = ResearchRoundRepo(db).get(round_id)
+            if round_row and round_row.task_id == task.id:
+                ResearchRoundRepo(db).update_status(round_row, ResearchRoundStatus.DONE.value)
+        else:
+            rows = paper_repo.replace_direction_papers(direction, papers)
+        ResearchDirectionRepo(db).update_papers_count(direction, len(paper_repo.list_for_direction(direction.id)))
 
         task.status = ResearchTaskStatus.DONE
         task.updated_at = datetime.now(timezone.utc)
         db.add(task)
         db.flush()
-        self._notify_user(
-            db,
-            task.user_id,
-            f"已完成方向 {direction_index} 检索，收录 {len(rows)} 篇。回复“调研 下一页”浏览结果，回复“调研 导出”导出文件。",
-        )
+        if round_id:
+            msg = (
+                f"已完成方向 {direction_index} 的第 {round_id} 轮检索，新增 {len(rows)} 篇。"
+                "请在本地调研页面继续下一轮。"
+            )
+        else:
+            msg = f"已完成方向 {direction_index} 检索，收录 {len(rows)} 篇。回复“调研 下一页”浏览结果，回复“调研 导出”导出文件。"
+        self._notify_user(db, task.user_id, msg)
 
-    def _run_fulltext_job(self, db: Session, task: ResearchTask, payload: dict) -> None:
+    def _run_fulltext_job(
+        self,
+        db: Session,
+        task: ResearchTask,
+        payload: dict,
+        *,
+        touch_lease: Callable[[], None] | None = None,
+    ) -> None:
         force = bool(payload.get("force") or False)
+        paper_filter = {str(x).strip() for x in _load_json_list(payload.get("paper_ids")) if str(x).strip()}
         papers = ResearchPaperRepo(db).list_for_task(task.id)
         fulltext_repo = ResearchPaperFulltextRepo(db)
         base_dir = Path(self.settings.research_artifact_dir).expanduser().resolve() / task.task_id / "fulltext"
         base_dir.mkdir(parents=True, exist_ok=True)
         for paper in papers:
             paper_id = _paper_token(paper)
+            if paper_filter and paper_id not in paper_filter:
+                continue
             current = fulltext_repo.get(task.id, paper_id)
             if (
                 current
@@ -658,7 +1039,9 @@ class ResearchService:
                 fetched_at=fetched_at,
             )
             try:
-                text, _meta = self._parse_pdf_bytes(pdf_bytes)
+                text, meta = self._parse_pdf_bytes(pdf_bytes)
+                sections = _extract_sections_lite(text)
+                quality = _estimate_text_quality(text)
                 text_path = base_dir / f"{file_stem}.txt"
                 text_path.write_text(text, encoding="utf-8")
                 fulltext_repo.upsert(
@@ -669,6 +1052,9 @@ class ResearchService:
                     pdf_path=str(pdf_path),
                     text_path=str(text_path),
                     text_chars=len(text),
+                    parser=str(meta.get("parser") or "")[:32] or None,
+                    quality_score=quality,
+                    sections_json=orjson.dumps(sections).decode("utf-8"),
                     fail_reason=None,
                     fetched_at=fetched_at,
                     parsed_at=datetime.now(timezone.utc),
@@ -683,6 +1069,8 @@ class ResearchService:
                     fail_reason=f"parse_failed:{exc}",
                     fetched_at=fetched_at,
                 )
+            if touch_lease:
+                touch_lease()
 
         task.status = ResearchTaskStatus.DONE
         task.updated_at = datetime.now(timezone.utc)
@@ -698,10 +1086,41 @@ class ResearchService:
             ),
         )
 
-    def _run_graph_job(self, db: Session, task: ResearchTask, payload: dict) -> None:
+    def _run_graph_job(
+        self,
+        db: Session,
+        task: ResearchTask,
+        payload: dict,
+        *,
+        touch_lease: Callable[[], None] | None = None,
+    ) -> None:
+        view = str(payload.get("view") or ResearchGraphViewType.CITATION.value).strip().lower()
         direction_index = _to_int_or_none(payload.get("direction_index"))
-        seed_top_n = max(1, int(self.settings.research_graph_seed_topn))
+        round_id = _to_int_or_none(payload.get("round_id"))
+        seed_top_n = max(1, int(payload.get("seed_top_n") or self.settings.research_graph_seed_topn))
+        expand_limit = max(1, int(payload.get("expand_limit_per_paper") or self.settings.research_graph_expand_limit_per_paper))
+        citation_sources = _resolve_citation_sources(payload.get("citation_sources"), self.settings.research_citation_sources_default)
         depth = max(1, int(self.settings.research_graph_depth_default))
+
+        if view == ResearchGraphViewType.TREE.value:
+            tree = self._build_tree_graph(db, task)
+            ResearchGraphSnapshotRepo(db).upsert_snapshot(
+                task_id=task.id,
+                direction_index=direction_index,
+                round_id=round_id,
+                view_type=ResearchGraphViewType.TREE.value,
+                depth=depth,
+                nodes=tree["nodes"],
+                edges=tree["edges"],
+                stats=tree["stats"],
+                status=ResearchGraphBuildStatus.DONE.value,
+            )
+            task.status = ResearchTaskStatus.DONE
+            task.updated_at = datetime.now(timezone.utc)
+            db.add(task)
+            db.flush()
+            return
+
         paper_repo = ResearchPaperRepo(db)
         fulltext_map = {
             row.paper_id: row.status.value
@@ -710,8 +1129,23 @@ class ResearchService:
         direction_repo = ResearchDirectionRepo(db)
         all_directions = direction_repo.list_for_task(task.id)
         direction_by_id = {d.id: d for d in all_directions}
+        source_coverage: dict[str, int] = {}
+        provider_errors: dict[str, str] = {}
+        fallback_used = False
 
-        if direction_index is not None:
+        if round_id is not None:
+            round_row = ResearchRoundRepo(db).get(round_id)
+            if not round_row or round_row.task_id != task.id:
+                raise ValueError("round not found")
+            direction_index = round_row.direction_index
+            refs = ResearchRoundPaperRepo(db).list_for_round(round_row.id)
+            rank_map = {x.paper_id: x.rank for x in refs}
+            seeds = paper_repo.list_by_ids([x.paper_id for x in refs])
+            seeds.sort(key=lambda x: rank_map.get(x.id, 999999))
+            seed_papers = seeds[:seed_top_n]
+            direction_row = direction_repo.get_by_index(task.id, direction_index)
+            used_directions = [direction_row] if direction_row else []
+        elif direction_index is not None:
             direction_row = direction_repo.get_by_index(task.id, direction_index)
             if not direction_row:
                 raise ValueError("direction not found")
@@ -772,7 +1206,21 @@ class ResearchService:
                     edges.append({"source": d_node_id, "target": p_id, "type": "direction_paper", "weight": 1.0})
                     edge_seen.add(key)
 
-            for item in self._fetch_citation_neighbors(paper, limit=max(1, int(self.settings.research_graph_expand_limit_per_paper))):
+            neighbor_result = self._fetch_citation_neighbors_multi(
+                db,
+                task=task,
+                paper=paper,
+                limit=expand_limit,
+                ordered_sources=citation_sources,
+                force_refresh=bool(payload.get("force_refresh") or False),
+            )
+            for src, count in (neighbor_result.get("source_coverage") or {}).items():
+                source_coverage[src] = source_coverage.get(src, 0) + int(count)
+            if neighbor_result.get("fallback_used"):
+                fallback_used = True
+            for src, err in (neighbor_result.get("provider_errors") or {}).items():
+                provider_errors[src] = err
+            for item in neighbor_result["items"]:
                 n_id = str(item.get("neighbor_id") or "").strip()
                 if not n_id:
                     continue
@@ -806,8 +1254,13 @@ class ResearchService:
                 edges.append(edge_item)
                 if edge_type in {"cites", "cited_by"}:
                     citation_edges.append(edge_item)
+            if touch_lease:
+                touch_lease()
 
         stats = self._compute_graph_stats(nodes=list(nodes.values()), edges=edges)
+        stats["source_coverage"] = source_coverage
+        stats["fallback_used"] = fallback_used
+        stats["provider_errors"] = provider_errors
         for node in nodes.values():
             if node["id"] in stats.get("scores", {}):
                 node["score"] = float(stats["scores"][node["id"]])
@@ -816,6 +1269,8 @@ class ResearchService:
         ResearchGraphSnapshotRepo(db).upsert_snapshot(
             task_id=task.id,
             direction_index=direction_index,
+            round_id=round_id,
+            view_type=ResearchGraphViewType.CITATION.value,
             depth=depth,
             nodes=list(nodes.values()),
             edges=edges,
@@ -1010,10 +1465,84 @@ class ResearchService:
                 return _normalize_pdf_text(text), {"parser": "pdfminer"}
         raise ValueError("pdf_parse_failed")
 
-    def _fetch_citation_neighbors(self, paper, *, limit: int) -> list[dict]:
+    def _fetch_citation_neighbors_multi(
+        self,
+        db: Session,
+        *,
+        task: ResearchTask,
+        paper,
+        limit: int,
+        ordered_sources: list[str],
+        force_refresh: bool,
+    ) -> dict:
+        paper_key = _paper_token(paper)
+        cache_repo = ResearchCitationFetchCacheRepo(db)
+        source_coverage: dict[str, int] = {}
+        provider_errors: dict[str, str] = {}
+        fallback_used = False
+        merged: list[dict] = []
+
+        for idx, source in enumerate(ordered_sources):
+            source_key = (source or "").strip().lower()
+            if not source_key:
+                continue
+            payload: dict | None = None
+            if not force_refresh:
+                payload = cache_repo.get_valid(task_id=task.id, paper_key=paper_key, source=source_key)
+            if payload:
+                items = _load_json_list_of_dict(payload.get("items"))
+                status = str(payload.get("status") or "cached")
+                error = payload.get("error")
+            else:
+                items, status, error = self._fetch_citation_by_source(source_key, paper=paper, limit=limit)
+                cache_repo.upsert(
+                    task_id=task.id,
+                    paper_key=paper_key,
+                    source=source_key,
+                    payload={"items": items, "status": status, "error": error},
+                    ttl_seconds=max(1, int(self.settings.research_citation_cache_ttl_seconds)),
+                )
+            if items:
+                source_coverage[source_key] = len(items)
+                merged.extend(items)
+                if idx > 0:
+                    fallback_used = True
+                break
+            provider_errors[source_key] = str(error or status or "empty")
+
+        seen: set[tuple[str, str, str]] = set()
+        unique: list[dict] = []
+        for item in merged:
+            src = str(item.get("source_id") or "").strip()
+            dst = str(item.get("target_id") or "").strip()
+            edge_type = str(item.get("edge_type") or "cites").strip()
+            if not src or not dst:
+                continue
+            key = (src, dst, edge_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return {
+            "items": unique,
+            "source_coverage": source_coverage,
+            "provider_errors": provider_errors,
+            "fallback_used": fallback_used,
+        }
+
+    def _fetch_citation_by_source(self, source: str, *, paper, limit: int) -> tuple[list[dict], str, str | None]:
+        if source == "semantic_scholar":
+            return self._fetch_citation_neighbors_semantic(paper, limit=limit)
+        if source == "openalex":
+            return self._fetch_citation_neighbors_openalex(paper, limit=limit)
+        if source == "crossref":
+            return self._fetch_citation_neighbors_crossref(paper, limit=limit)
+        return [], "unsupported_source", f"unsupported_source:{source}"
+
+    def _fetch_citation_neighbors_semantic(self, paper, *, limit: int) -> tuple[list[dict], str, str | None]:
         identifier = _semantic_scholar_identifier_for_paper(paper)
         if not identifier:
-            return []
+            return [], "missing_identifier", "missing_identifier"
         api_key = self.settings.semantic_scholar_api_key.strip()
         headers = {"User-Agent": "MemoMate/0.1 (citation-graph)"}
         if api_key:
@@ -1027,10 +1556,10 @@ class ResearchService:
             with httpx.Client(timeout=20, trust_env=False) as client:
                 resp = client.get(url, params={"fields": fields}, headers=headers)
             if resp.status_code >= 400:
-                return []
+                return [], f"http_{resp.status_code}", f"http_{resp.status_code}"
             payload = resp.json()
-        except Exception:
-            return []
+        except Exception as exc:
+            return [], "transport_error", str(exc)
 
         base_id = _paper_token(paper)
         items: list[dict] = []
@@ -1070,7 +1599,108 @@ class ResearchService:
                     "weight": 1.0,
                 }
             )
-        return items
+        return items, ("ok" if items else "ok_empty"), None
+
+    def _fetch_citation_neighbors_openalex(self, paper, *, limit: int) -> tuple[list[dict], str, str | None]:
+        doi = (paper.doi or "").strip().lower()
+        if not doi:
+            return [], "missing_doi", "missing_doi"
+        base_id = _paper_token(paper)
+        items: list[dict] = []
+        try:
+            with httpx.Client(timeout=20, trust_env=False) as client:
+                work_resp = client.get(
+                    f"https://api.openalex.org/works/https://doi.org/{quote_plus(doi)}",
+                    params={"select": "id,referenced_works,cited_by_api_url"},
+                )
+                if work_resp.status_code >= 400:
+                    return [], f"http_{work_resp.status_code}", f"http_{work_resp.status_code}"
+                work = work_resp.json()
+                refs = work.get("referenced_works") if isinstance(work, dict) else []
+                for ref in (refs or [])[:limit]:
+                    ref_id = _normalize_openalex_id(ref)
+                    if not ref_id:
+                        continue
+                    items.append(
+                        {
+                            "source_id": base_id,
+                            "target_id": ref_id,
+                            "neighbor_id": ref_id,
+                            "title": ref_id,
+                            "year": None,
+                            "source": "openalex",
+                            "edge_type": "cites",
+                            "source_name": "openalex",
+                            "weight": 1.0,
+                        }
+                    )
+                cited_url = work.get("cited_by_api_url") if isinstance(work, dict) else None
+                if isinstance(cited_url, str) and cited_url.strip():
+                    cited_resp = client.get(cited_url, params={"per-page": limit, "select": "id,display_name,publication_year"})
+                    if cited_resp.status_code < 400:
+                        cited_data = cited_resp.json()
+                        results = cited_data.get("results") if isinstance(cited_data, dict) else []
+                        for row in (results or [])[:limit]:
+                            cid = _normalize_openalex_id(row.get("id"))
+                            if not cid:
+                                continue
+                            items.append(
+                                {
+                                    "source_id": cid,
+                                    "target_id": base_id,
+                                    "neighbor_id": cid,
+                                    "title": str(row.get("display_name") or cid)[:240],
+                                    "year": _to_int_or_none(row.get("publication_year")),
+                                    "source": "openalex",
+                                    "edge_type": "cited_by",
+                                    "source_name": "openalex",
+                                    "weight": 1.0,
+                                }
+                            )
+        except Exception as exc:
+            return [], "transport_error", str(exc)
+        return items, ("ok" if items else "ok_empty"), None
+
+    def _fetch_citation_neighbors_crossref(self, paper, *, limit: int) -> tuple[list[dict], str, str | None]:
+        doi = (paper.doi or "").strip().lower()
+        if not doi:
+            return [], "missing_doi", "missing_doi"
+        base_id = _paper_token(paper)
+        items: list[dict] = []
+        url = f"https://api.crossref.org/works/{quote_plus(doi)}"
+        try:
+            with httpx.Client(timeout=20, trust_env=False) as client:
+                resp = client.get(url)
+            if resp.status_code >= 400:
+                return [], f"http_{resp.status_code}", f"http_{resp.status_code}"
+            payload = resp.json()
+        except Exception as exc:
+            return [], "transport_error", str(exc)
+        message = payload.get("message") if isinstance(payload, dict) else {}
+        references = message.get("reference") if isinstance(message, dict) else []
+        for row in (references or [])[:limit]:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("article-title") or row.get("series-title") or "").strip()
+            neighbor_doi = str(row.get("DOI") or "").strip().lower()
+            neighbor_id = _citation_neighbor_id(title=title, doi=neighbor_doi, fallback_seed=str(row.get("key") or "ref"))
+            if not neighbor_id:
+                continue
+            year = _to_int_or_none(row.get("year"))
+            items.append(
+                {
+                    "source_id": base_id,
+                    "target_id": neighbor_id,
+                    "neighbor_id": neighbor_id,
+                    "title": (title or neighbor_id)[:240],
+                    "year": year,
+                    "source": "crossref",
+                    "edge_type": "cites",
+                    "source_name": "crossref",
+                    "weight": 1.0,
+                }
+            )
+        return items, ("ok" if items else "ok_empty"), None
 
     def _compute_graph_stats(self, *, nodes: list[dict], edges: list[dict]) -> dict:
         paper_nodes = [n for n in nodes if n.get("type") == "paper"]
@@ -1119,6 +1749,171 @@ class ResearchService:
             "components": int(components),
             "top_central_papers": [{"paper_id": pid, "score": score} for pid, score in top],
             "scores": scores,
+        }
+
+    def _round_reference_titles(self, db: Session, *, round_id: int, limit: int = 8) -> list[str]:
+        refs = ResearchRoundPaperRepo(db).list_for_round(round_id)
+        paper_ids = [row.paper_id for row in refs[:limit]]
+        rows = ResearchPaperRepo(db).list_by_ids(paper_ids)
+        return [row.title for row in rows if row.title][:limit]
+
+    def _generate_round_candidates(
+        self,
+        *,
+        task_topic: str,
+        action: str,
+        feedback_text: str,
+        query_terms: list[str],
+        references: list[str],
+        candidate_count: int,
+    ) -> list[dict]:
+        prompt = (
+            "你是 memomate-research-planner，请根据输入生成下一轮调研候选方向。"
+            "返回 JSON: {\"candidates\":[{\"name\":\"\",\"queries\":[\"\"],\"reason\":\"\"}]}。\n\n"
+            f"Topic: {task_topic}\n"
+            f"Action: {action}\n"
+            f"Feedback: {feedback_text}\n"
+            f"Current queries: {orjson.dumps(query_terms).decode('utf-8')}\n"
+            f"Reference titles: {orjson.dumps(references).decode('utf-8')}\n"
+            f"Candidates: {candidate_count}"
+        )
+        try:
+            result = self.openclaw_client.chat_completion(
+                task_type=LLMTaskType.RESEARCH_PLAN,
+                prompt=prompt,
+                system_prompt="Return strict JSON only.",
+                temperature=0.2,
+                max_tokens=900,
+            )
+            text = (result.text or "").strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+                text = re.sub(r"\s*```$", "", text).strip()
+            data = _extract_first_json_object(text)
+            raw = data.get("candidates") if isinstance(data, dict) else None
+            candidates: list[dict] = []
+            if isinstance(raw, list):
+                for item in raw[:candidate_count]:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    queries = [str(x).strip() for x in (item.get("queries") or []) if str(x).strip()]
+                    if not name:
+                        continue
+                    if len(queries) < 2:
+                        queries = [name, f"{name} methods"]
+                    candidates.append(
+                        {
+                            "name": name[:255],
+                            "queries": queries[:4],
+                            "reason": str(item.get("reason") or "").strip()[:1000] or None,
+                        }
+                    )
+            if candidates:
+                return candidates
+        except Exception:
+            logger.exception("research_round_candidate_generate_failed")
+        base = (feedback_text or task_topic or "research topic").strip()
+        seed = [x for x in query_terms if x][:2] or [task_topic]
+        templates = [
+            ("问题定义与评测边界", [f"{seed[0]} benchmark", f"{base} evaluation"], "收敛评测协议和问题边界"),
+            ("核心方法深化", [f"{seed[0]} method", f"{base} architecture"], "针对当前方向深化方法细节"),
+            ("数据与泛化", [f"{seed[0]} dataset", f"{base} generalization"], "补齐数据与泛化证据"),
+            ("误差与失败案例", [f"{seed[0]} error analysis", f"{base} failure cases"], "关注失败模式和可解释性"),
+            ("临床/业务落地", [f"{seed[0]} deployment", f"{base} real world"], "评估实际应用可行性"),
+        ]
+        out = []
+        for name, queries, reason in templates[:candidate_count]:
+            out.append({"name": name, "queries": queries[:4], "reason": reason})
+        return out
+
+    def _build_tree_graph(self, db: Session, task: ResearchTask) -> dict:
+        round_repo = ResearchRoundRepo(db)
+        round_rows = round_repo.list_for_task(task.id)
+        direction_rows = ResearchDirectionRepo(db).list_for_task(task.id)
+        direction_map = {row.direction_index: row for row in direction_rows}
+        round_paper_repo = ResearchRoundPaperRepo(db)
+        paper_repo = ResearchPaperRepo(db)
+
+        nodes: dict[str, dict] = {}
+        edges: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        topic_id = f"topic:{task.task_id}"
+        nodes[topic_id] = {"id": topic_id, "type": "topic", "label": task.topic}
+
+        for direction in direction_rows:
+            d_id = f"direction:{task.task_id}:{direction.direction_index}"
+            nodes[d_id] = {
+                "id": d_id,
+                "type": "direction",
+                "label": direction.name,
+                "direction_index": direction.direction_index,
+            }
+            key = (topic_id, d_id, "topic_direction")
+            if key not in seen:
+                edges.append({"source": topic_id, "target": d_id, "type": "topic_direction", "weight": 1.0})
+                seen.add(key)
+
+        for row in round_rows:
+            r_id = f"round:{row.id}"
+            nodes[r_id] = {
+                "id": r_id,
+                "type": "round",
+                "label": f"Round {row.depth}",
+                "direction_index": row.direction_index,
+                "depth": row.depth,
+                "action": row.action.value,
+                "status": row.status.value,
+                "source": "memomate",
+            }
+            if row.parent_round_id:
+                p_id = f"round:{row.parent_round_id}"
+                key = (p_id, r_id, "round_round")
+                if key not in seen:
+                    edges.append({"source": p_id, "target": r_id, "type": "round_round", "weight": 1.0})
+                    seen.add(key)
+            else:
+                d = direction_map.get(row.direction_index)
+                if d:
+                    d_id = f"direction:{task.task_id}:{d.direction_index}"
+                    key = (d_id, r_id, "direction_round")
+                    if key not in seen:
+                        edges.append({"source": d_id, "target": r_id, "type": "direction_round", "weight": 1.0})
+                        seen.add(key)
+
+            refs = round_paper_repo.list_for_round(row.id)[:20]
+            papers = paper_repo.list_by_ids([x.paper_id for x in refs])
+            rank = {x.paper_id: x.rank for x in refs}
+            papers.sort(key=lambda p: rank.get(p.id, 999999))
+            for paper in papers:
+                p_id = _paper_token(paper)
+                if p_id not in nodes:
+                    nodes[p_id] = {
+                        "id": p_id,
+                        "type": "paper",
+                        "label": paper.title[:240],
+                        "year": paper.year,
+                        "source": paper.source,
+                        "direction_index": row.direction_index,
+                    }
+                key = (r_id, p_id, "round_paper")
+                if key not in seen:
+                    edges.append({"source": r_id, "target": p_id, "type": "round_paper", "weight": 1.0})
+                    seen.add(key)
+
+        return {
+            "direction_index": None,
+            "round_id": None,
+            "depth": 1,
+            "status": ResearchGraphBuildStatus.DONE.value,
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "stats": {
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+                "round_count": len(round_rows),
+            },
         }
 
     def _plan_directions(self, topic: str, constraints: dict) -> list[dict]:
@@ -1398,12 +2193,15 @@ class ResearchService:
         next_retry_job = job_repo.next_retry_for_task(row.id)
         fulltext_stats = ResearchPaperFulltextRepo(db).summary_for_task(row.id)
         latest_graph = ResearchGraphSnapshotRepo(db).latest_for_task(row.id)
+        rounds_total = len(ResearchRoundRepo(db).list_for_task(row.id))
         graph_stats = _load_json_dict(latest_graph.stats_json) if latest_graph else {}
         if latest_graph:
             graph_stats = {
                 **graph_stats,
                 "status": latest_graph.status.value,
                 "direction_index": latest_graph.direction_index,
+                "round_id": latest_graph.round_id,
+                "view": latest_graph.view_type.value,
                 "updated_at": latest_graph.updated_at.isoformat() if latest_graph.updated_at else None,
             }
         return {
@@ -1422,6 +2220,7 @@ class ResearchService:
                 for d in directions
             ],
             "papers_total": papers_total,
+            "rounds_total": rounds_total,
             "last_job_type": latest_job.job_type.value if latest_job else None,
             "last_job_status": latest_job.status.value if latest_job else None,
             "last_failure_reason": (latest_job.error or None) if latest_job else None,
@@ -1621,7 +2420,13 @@ class ResearchService:
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode("utf-8") + "\n"
 
 
-def _load_json_list(value: str | None) -> list[str]:
+def _load_json_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x).strip()]
+    if not isinstance(value, str):
+        return []
     if not value:
         return []
     try:
@@ -1633,7 +2438,13 @@ def _load_json_list(value: str | None) -> list[str]:
     return [str(x) for x in data if str(x).strip()]
 
 
-def _load_json_dict(value: str | None) -> dict:
+def _load_json_dict(value: object) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
     if not value:
         return {}
     try:
@@ -1645,7 +2456,13 @@ def _load_json_dict(value: str | None) -> dict:
     return data
 
 
-def _load_json_list_of_dict(value: str | None) -> list[dict]:
+def _load_json_list_of_dict(value: object) -> list[dict]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not isinstance(value, str):
+        return []
     if not value:
         return []
     try:
@@ -1688,6 +2505,28 @@ def _resolve_sources(sources: object, default_sources: str) -> set[str]:
     if not values:
         values = [item.strip().lower() for item in default_sources.split(",") if item.strip()]
     return {item for item in values if item in allowed}
+
+
+def _resolve_citation_sources(sources: object, default_sources: str) -> list[str]:
+    allowed = {"semantic_scholar", "openalex", "crossref"}
+    values: list[str] = []
+    if isinstance(sources, str):
+        values = [item.strip().lower() for item in re.split(r"[,\s|]+", sources) if item.strip()]
+    elif isinstance(sources, list):
+        values = [str(item).strip().lower() for item in sources if str(item).strip()]
+    if not values:
+        values = [item.strip().lower() for item in default_sources.split(",") if item.strip()]
+    out = [item for item in values if item in allowed]
+    if not out:
+        return ["semantic_scholar"]
+    dedup: list[str] = []
+    seen = set()
+    for item in out:
+        if item in seen:
+            continue
+        seen.add(item)
+        dedup.append(item)
+    return dedup
 
 
 def _merge_query_and_excludes(query: str, exclude_terms: list[str]) -> str:
@@ -1748,6 +2587,54 @@ def _normalize_pdf_text(text: str) -> str:
     return value.strip()
 
 
+def _estimate_text_quality(text: str) -> float:
+    value = (text or "").strip()
+    if not value:
+        return 0.0
+    total = len(value)
+    alpha = sum(1 for ch in value if ch.isalpha())
+    digit = sum(1 for ch in value if ch.isdigit())
+    bad = sum(1 for ch in value if ord(ch) < 9 or ord(ch) == 127)
+    ratio = (alpha + 0.3 * digit) / max(1, total)
+    penalty = bad / max(1, total)
+    score = max(0.0, min(1.0, ratio - penalty))
+    return round(float(score), 4)
+
+
+def _extract_sections_lite(text: str) -> dict:
+    value = (text or "").strip()
+    if not value:
+        return {}
+    normalized = re.sub(r"\r\n?", "\n", value)
+    patterns = [
+        ("abstract", r"\babstract\b"),
+        ("introduction", r"\bintroduction\b"),
+        ("method", r"\bmethods?\b|\bmethodology\b"),
+        ("results", r"\bresults?\b"),
+        ("conclusion", r"\bconclusions?\b"),
+        ("references", r"\breferences\b"),
+    ]
+    lines = normalized.splitlines()
+    hits: dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        low = line.strip().lower()
+        for key, pattern in patterns:
+            if key in hits:
+                continue
+            if re.search(pattern, low):
+                hits[key] = idx
+    if not hits:
+        return {}
+    ordered = sorted(hits.items(), key=lambda kv: kv[1])
+    result: dict[str, str] = {}
+    for pos, (key, start_idx) in enumerate(ordered):
+        end_idx = ordered[pos + 1][1] if pos + 1 < len(ordered) else len(lines)
+        chunk = "\n".join(lines[start_idx:end_idx]).strip()
+        if chunk:
+            result[key] = chunk[:2000]
+    return result
+
+
 def _extract_pdf_links_from_html(html: str, base_url: str) -> list[str]:
     if not html:
         return []
@@ -1770,6 +2657,26 @@ def _semantic_scholar_identifier_for_paper(paper) -> str | None:
     if doi:
         return f"DOI:{doi}"
     return None
+
+
+def _normalize_openalex_id(raw: object) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "/" in value:
+        value = value.rsplit("/", 1)[-1]
+    return value.strip()
+
+
+def _citation_neighbor_id(*, title: str, doi: str, fallback_seed: str) -> str:
+    doi_norm = (doi or "").strip().lower()
+    if doi_norm:
+        return doi_norm
+    title_norm = _normalize_title(title)
+    if title_norm:
+        return title_norm[:120]
+    fallback = _normalize_title(fallback_seed)
+    return fallback[:120] or ""
 
 
 def _normalize_neighbor_from_s2(payload: object) -> dict | None:

@@ -16,13 +16,16 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.domain.enums import (
+    ResearchActionType,
     DeliveryStatus,
     OperationType,
     PendingActionStatus,
     ResearchGraphBuildStatus,
+    ResearchGraphViewType,
     ResearchJobStatus,
     ResearchJobType,
     ResearchPaperFulltextStatus,
+    ResearchRoundStatus,
     ResearchTaskStatus,
     ReminderSource,
     ReminderStatus,
@@ -234,6 +237,10 @@ class ResearchJob(Base):
     payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    queue_name: Mapped[str] = mapped_column(String(32), default="research", nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -292,6 +299,9 @@ class ResearchPaperFulltext(Base):
     pdf_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     text_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     text_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    parser: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sections_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     status: Mapped[ResearchPaperFulltextStatus] = mapped_column(
         Enum(ResearchPaperFulltextStatus), nullable=False, default=ResearchPaperFulltextStatus.NOT_STARTED
     )
@@ -323,7 +333,13 @@ class ResearchGraphSnapshot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), nullable=False)
+    round_id: Mapped[int | None] = mapped_column(ForeignKey("research_rounds.id"), nullable=True)
     direction_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    view_type: Mapped[ResearchGraphViewType] = mapped_column(
+        Enum(ResearchGraphViewType),
+        nullable=False,
+        default=ResearchGraphViewType.CITATION,
+    )
     depth: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     nodes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     edges_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -331,5 +347,72 @@ class ResearchGraphSnapshot(Base):
     status: Mapped[ResearchGraphBuildStatus] = mapped_column(
         Enum(ResearchGraphBuildStatus), nullable=False, default=ResearchGraphBuildStatus.QUEUED
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResearchRound(Base):
+    __tablename__ = "research_rounds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), nullable=False)
+    direction_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_round_id: Mapped[int | None] = mapped_column(ForeignKey("research_rounds.id"), nullable=True)
+    depth: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    action: Mapped[ResearchActionType] = mapped_column(
+        Enum(ResearchActionType), nullable=False, default=ResearchActionType.EXPAND
+    )
+    feedback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    query_terms_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    status: Mapped[ResearchRoundStatus] = mapped_column(
+        Enum(ResearchRoundStatus), nullable=False, default=ResearchRoundStatus.QUEUED
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResearchRoundCandidate(Base):
+    __tablename__ = "research_round_candidates"
+    __table_args__ = (
+        UniqueConstraint("round_id", "candidate_index", name="uq_research_round_candidate_idx"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    round_id: Mapped[int] = mapped_column(ForeignKey("research_rounds.id"), nullable=False)
+    candidate_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    queries_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResearchRoundPaper(Base):
+    __tablename__ = "research_round_papers"
+    __table_args__ = (
+        UniqueConstraint("round_id", "paper_id", "role", name="uq_research_round_paper_role"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    round_id: Mapped[int] = mapped_column(ForeignKey("research_rounds.id"), nullable=False)
+    paper_id: Mapped[int] = mapped_column(ForeignKey("research_papers.id"), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="seed")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResearchCitationFetchCache(Base):
+    __tablename__ = "research_citation_fetch_cache"
+    __table_args__ = (
+        UniqueConstraint("task_id", "paper_key", "source", name="uq_research_citation_fetch_cache"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), nullable=False)
+    paper_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

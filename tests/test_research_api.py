@@ -199,19 +199,24 @@ def test_graph_build_and_view_endpoint():
         service.enqueue_search(db_session, user_id=user.id, direction_index=1)
         service.process_one_job(db_session)
 
-        service._fetch_citation_neighbors = lambda paper, *, limit: [  # noqa: E731
-            {
-                "source_id": "seed-1",
-                "target_id": "nbr-1",
-                "neighbor_id": "nbr-1",
-                "title": "Neighbor Paper",
-                "year": 2024,
-                "source": "semantic_scholar",
-                "edge_type": "cites",
-                "source_name": "semantic_scholar",
-                "weight": 1.0,
-            }
-        ]
+        service._fetch_citation_neighbors_multi = lambda db, *, task, paper, limit, ordered_sources, force_refresh: {  # noqa: E731
+            "items": [
+                {
+                    "source_id": "seed-1",
+                    "target_id": "nbr-1",
+                    "neighbor_id": "nbr-1",
+                    "title": "Neighbor Paper",
+                    "year": 2024,
+                    "source": "semantic_scholar",
+                    "edge_type": "cites",
+                    "source_name": "semantic_scholar",
+                    "weight": 1.0,
+                }
+            ],
+            "source_coverage": {"semantic_scholar": 1},
+            "provider_errors": {},
+            "fallback_used": False,
+        }
         build_resp = client.post(
             f"/api/v1/research/tasks/{task.task_id}/graph/build",
             json={"direction_index": 1},
@@ -230,6 +235,75 @@ def test_graph_build_and_view_endpoint():
         view_resp = client.get(f"/api/v1/research/tasks/{task.task_id}/graph/view?direction_index=1")
         assert view_resp.status_code == 200
         assert "cytoscape" in view_resp.text.lower()
+    finally:
+        client.close()
+        db_session.close()
+
+
+def test_explore_round_flow_and_tree_endpoint():
+    client, service, user, db_session = _build_test_client()
+    try:
+        task = service.create_task(
+            db_session,
+            user_id=user.id,
+            topic="api explore topic",
+            constraints={"top_n": 5},
+        )
+        service.process_one_job(db_session)
+        service._search_semantic_scholar = lambda query, *, top_n, constraints: (  # noqa: E731
+            [
+                {
+                    "paper_id": "seed-1",
+                    "title": "Seed Paper",
+                    "title_norm": "seed paper",
+                    "authors": ["A"],
+                    "year": 2025,
+                    "venue": "MICCAI",
+                    "doi": "10.1000/seed-1",
+                    "url": "https://example.org/seed1",
+                    "abstract": "abstract",
+                    "source": "semantic_scholar",
+                    "relevance_score": None,
+                }
+            ],
+            "ok",
+            None,
+        )
+        service._search_arxiv = lambda query, *, top_n, constraints: ([], "ok_empty", None)  # noqa: E731
+
+        start_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/explore/start",
+            json={"direction_index": 1},
+        )
+        assert start_resp.status_code == 200
+        round_id = start_resp.json()["round_id"]
+        service.process_one_job(db_session)
+
+        propose_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/explore/rounds/{round_id}/propose",
+            json={"action": "deepen", "feedback_text": "关注 hallucination 评估", "candidate_count": 3},
+        )
+        assert propose_resp.status_code == 200
+        candidates = propose_resp.json()["candidates"]
+        assert len(candidates) >= 1
+        candidate_id = candidates[0]["candidate_id"]
+
+        select_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/explore/rounds/{round_id}/select",
+            json={"candidate_id": candidate_id},
+        )
+        assert select_resp.status_code == 200
+        child_round_id = select_resp.json()["child_round_id"]
+        assert child_round_id > round_id
+        service.process_one_job(db_session)
+
+        tree_resp = client.get(f"/api/v1/research/tasks/{task.task_id}/explore/tree")
+        assert tree_resp.status_code == 200
+        tree = tree_resp.json()
+        node_types = {item["type"] for item in tree["nodes"]}
+        assert "topic" in node_types
+        assert "direction" in node_types
+        assert "round" in node_types
     finally:
         client.close()
         db_session.close()
