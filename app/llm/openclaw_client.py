@@ -5,6 +5,7 @@ from enum import Enum
 from pathlib import Path
 from time import perf_counter, sleep
 import subprocess
+from urllib.parse import urlparse
 
 import httpx
 import orjson
@@ -149,7 +150,8 @@ class OpenClawClient:
             payload["user"] = user.strip()
 
         started = perf_counter()
-        with httpx.Client(timeout=max(1, self.settings.openclaw_timeout_seconds)) as client:
+        trust_env = not _is_local_openclaw_base(self.settings.openclaw_base_url)
+        with httpx.Client(timeout=max(1, self.settings.openclaw_timeout_seconds), trust_env=trust_env) as client:
             resp = client.post(url, headers=headers, json=payload)
 
         if resp.status_code >= 400:
@@ -279,7 +281,8 @@ class OpenClawClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
-            with httpx.Client(timeout=3) as client:
+            trust_env = not _is_local_openclaw_base(self.settings.openclaw_base_url)
+            with httpx.Client(timeout=3, trust_env=trust_env) as client:
                 resp = client.get(url, headers=headers)
             if resp.status_code == 200:
                 return True, None
@@ -360,3 +363,11 @@ def _extract_cli_text(payload: dict) -> str:
             if isinstance(text, str) and text.strip():
                 return text.strip()
     raise ValueError("openclaw cli output contains no text payload")
+
+
+def _is_local_openclaw_base(base_url: str) -> bool:
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}

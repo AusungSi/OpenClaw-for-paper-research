@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+from time import sleep
 from urllib.parse import quote_plus
 from xml.etree import ElementTree as ET
 import re
@@ -381,7 +382,7 @@ class ResearchService:
         if text.startswith("```"):
             text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
             text = re.sub(r"\s*```$", "", text).strip()
-        data = orjson.loads(text)
+        data = _extract_first_json_object(text)
         if not isinstance(data, dict):
             return []
         raw_dirs = data.get("directions")
@@ -440,23 +441,64 @@ class ResearchService:
         params = {
             "query": query,
             "limit": max(1, min(100, top_n)),
-            "fields": "title,authors,year,venue,abstract,doi,url",
+            # `doi` field is no longer directly queryable in some API versions.
+            "fields": "title,authors,year,venue,abstract,externalIds,url",
         }
         if year_from:
             params["year"] = f"{year_from}-{year_to or datetime.now().year}"
-        try:
-            with httpx.Client(timeout=20) as client:
-                resp = client.get(url, params=params)
-                if resp.status_code >= 400:
-                    return []
+        headers = {"User-Agent": "MemoMate/0.1 (research)"}
+        api_key = self.settings.semantic_scholar_api_key.strip()
+        if api_key:
+            headers["x-api-key"] = api_key
+
+        payload: dict | None = None
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=20) as client:
+                    resp = client.get(url, params=params, headers=headers)
+            except Exception:
+                if attempt < 2:
+                    sleep(0.25 * (2**attempt))
+                    continue
+                return []
+
+            if resp.status_code == 429:
+                if attempt < 2:
+                    sleep(0.5 * (2**attempt))
+                    continue
+                logger.warning(
+                    "semantic_scholar_rate_limited query=%s has_api_key=%s",
+                    query[:120],
+                    bool(api_key),
+                )
+                return []
+            if 500 <= resp.status_code < 600:
+                if attempt < 2:
+                    sleep(0.35 * (2**attempt))
+                    continue
+                return []
+            if resp.status_code >= 400:
+                logger.warning("semantic_scholar_http_error status=%s query=%s", resp.status_code, query[:120])
+                return []
+            try:
                 payload = resp.json()
-        except Exception:
+            except Exception:
+                return []
+            break
+
+        if payload is None:
             return []
         papers = []
         for item in payload.get("data", []) if isinstance(payload, dict) else []:
             title = str(item.get("title") or "").strip()
             if not title:
                 continue
+            external_ids = item.get("externalIds") if isinstance(item, dict) else None
+            doi_val = None
+            if isinstance(external_ids, dict):
+                raw_doi = external_ids.get("DOI")
+                if isinstance(raw_doi, str) and raw_doi.strip():
+                    doi_val = raw_doi.strip()
             papers.append(
                 {
                     "paper_id": item.get("paperId"),
@@ -465,7 +507,7 @@ class ResearchService:
                     "authors": [str(a.get("name") or "").strip() for a in (item.get("authors") or []) if a.get("name")],
                     "year": item.get("year"),
                     "venue": item.get("venue"),
-                    "doi": (item.get("doi") or "").strip() or None,
+                    "doi": doi_val,
                     "url": item.get("url"),
                     "abstract": item.get("abstract"),
                     "source": "semantic_scholar",
@@ -478,7 +520,7 @@ class ResearchService:
         start = 0
         max_results = max(1, min(100, top_n))
         q = quote_plus(query)
-        url = f"http://export.arxiv.org/api/query?search_query=all:{q}&start={start}&max_results={max_results}"
+        url = f"https://export.arxiv.org/api/query?search_query=all:{q}&start={start}&max_results={max_results}"
         try:
             with httpx.Client(timeout=20) as client:
                 resp = client.get(url)
@@ -487,7 +529,12 @@ class ResearchService:
                 xml = resp.text
         except Exception:
             return []
-        root = ET.fromstring(xml)
+        if not xml or not xml.strip():
+            return []
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return []
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         papers = []
         year_from = constraints.get("year_from")
@@ -774,3 +821,26 @@ def _merge_query_and_excludes(query: str, exclude_terms: list[str]) -> str:
     if not excludes:
         return value
     return f"{value} " + " ".join(f"-{item}" for item in excludes)
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        data = orjson.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    for idx, char in enumerate(raw):
+        if char != "{":
+            continue
+        candidate = raw[idx:]
+        try:
+            data = orjson.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None

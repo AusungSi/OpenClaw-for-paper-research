@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     research_page_size: int = 10
     research_sources_default: str = "semantic_scholar,arxiv"
     research_artifact_dir: str = "./artifacts/research"
+    semantic_scholar_api_key: str = ""
 
 
 @lru_cache(maxsize=1)

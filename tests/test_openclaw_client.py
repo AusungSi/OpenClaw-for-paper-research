@@ -26,7 +26,7 @@ def test_chat_completion_http_success(monkeypatch):
             return {"choices": [{"message": {"content": "{\"ok\":true}"}}]}
 
     class DummyClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, trust_env=True):
             self.timeout = timeout
 
         def __enter__(self):
@@ -101,3 +101,40 @@ def test_chat_completion_http_401_does_not_fallback(monkeypatch):
 
     assert exc.value.status_code == 401
     assert called["fallback"] is False
+
+
+def test_local_openclaw_http_bypasses_proxy_env(monkeypatch):
+    captured = {"trust_env": None}
+
+    class DummyResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class DummyClient:
+        def __init__(self, timeout, trust_env):
+            captured["trust_env"] = trust_env
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, headers, json):
+            return DummyResponse()
+
+    monkeypatch.setattr("app.llm.openclaw_client.httpx.Client", DummyClient)
+
+    settings = Settings(
+        openclaw_enabled=True,
+        openclaw_base_url="http://127.0.0.1:18789",
+        openclaw_gateway_token="x",
+        openclaw_agent_id="memomate",
+        openclaw_retries=1,
+    )
+    client = OpenClawClient(settings=settings)
+    _ = client.chat_completion(task_type=LLMTaskType.INTENT_PARSE, prompt="ping")
+    assert captured["trust_env"] is False
