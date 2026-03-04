@@ -121,6 +121,13 @@ class HealthResponse(BaseModel):
     openclaw_http_fail: int = 0
     openclaw_cli_fallback_count: int = 0
     openclaw_latency_ms: int = 0
+    research_jobs_total: int = 0
+    research_job_latency_ms: int = 0
+    research_cache_hit: int = 0
+    research_cache_miss: int = 0
+    research_export_success: int = 0
+    research_export_fail: int = 0
+    research_search_source_status: dict[str, int] = Field(default_factory=dict)
 
 
 class CapabilityItem(BaseModel):
@@ -366,6 +373,83 @@ class ResearchTaskCreateRequest(BaseModel):
 class ResearchTaskSearchRequest(BaseModel):
     direction_index: int
     top_n: int | None = None
+    force_refresh: bool = False
+
+
+class ResearchTaskPlanResponse(BaseModel):
+    task_id: str
+    status: str
+    queued: bool = True
+
+
+class ResearchTaskSearchEnqueueResponse(BaseModel):
+    task_id: str
+    status: str
+    direction_index: int
+    force_refresh: bool = False
+
+
+class ResearchFulltextBuildResponse(BaseModel):
+    task_id: str
+    status: str
+    queued: bool = True
+
+
+class ResearchFulltextItem(BaseModel):
+    paper_id: str
+    status: str
+    source_url: str | None = None
+    pdf_path: str | None = None
+    text_path: str | None = None
+    text_chars: int = 0
+    fail_reason: str | None = None
+    fetched_at: datetime | None = None
+    parsed_at: datetime | None = None
+
+
+class ResearchFulltextStatusResponse(BaseModel):
+    task_id: str
+    summary: dict[str, int] = Field(default_factory=dict)
+    items: list[ResearchFulltextItem] = Field(default_factory=list)
+
+
+class ResearchGraphBuildRequest(BaseModel):
+    direction_index: int | None = None
+
+
+class ResearchGraphBuildResponse(BaseModel):
+    task_id: str
+    status: str
+    queued: bool = True
+    direction_index: int | None = None
+
+
+class ResearchGraphNode(BaseModel):
+    id: str
+    type: str
+    label: str
+    year: int | None = None
+    source: str | None = None
+    direction_index: int | None = None
+    score: float | None = None
+    fulltext_status: str | None = None
+
+
+class ResearchGraphEdge(BaseModel):
+    source: str
+    target: str
+    type: str
+    weight: float = 1.0
+
+
+class ResearchGraphResponse(BaseModel):
+    task_id: str
+    direction_index: int | None = None
+    depth: int = 1
+    status: str
+    nodes: list[ResearchGraphNode] = Field(default_factory=list)
+    edges: list[ResearchGraphEdge] = Field(default_factory=list)
+    stats: dict = Field(default_factory=dict)
 
 
 class ResearchDirectionItem(BaseModel):
@@ -396,6 +480,13 @@ class ResearchTaskResponse(BaseModel):
     constraints: dict = Field(default_factory=dict)
     directions: list[ResearchDirectionItem] = Field(default_factory=list)
     papers_total: int = 0
+    last_job_type: str | None = None
+    last_job_status: str | None = None
+    last_failure_reason: str | None = None
+    last_attempts: int = 0
+    next_retry_at: datetime | None = None
+    fulltext_stats: dict[str, int] = Field(default_factory=dict)
+    graph_stats: dict = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 

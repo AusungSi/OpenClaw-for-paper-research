@@ -11,6 +11,7 @@ from app.llm.ollama_client import OllamaClient
 from app.services.asr_service import AsrService
 from app.services.intent_service import IntentService
 from app.services.message_ingest import MessageIngestService
+from app.services.research_service import ResearchService
 from app.services.reply_generation_service import ReplyGenerationService
 from app.services.scheduler_service import SchedulerService
 
@@ -46,6 +47,10 @@ def get_reply_generation(request: Request) -> ReplyGenerationService:
     return request.app.state.reply_generation_service
 
 
+def get_research_service(request: Request) -> ResearchService:
+    return request.app.state.research_service
+
+
 @router.get("/health", response_model=HealthResponse)
 def healthcheck(
     request: Request,
@@ -57,6 +62,7 @@ def healthcheck(
     intent_service: IntentService = Depends(get_intent_service),
     asr_service: AsrService = Depends(get_asr),
     reply_generation_service: ReplyGenerationService = Depends(get_reply_generation),
+    research_service: ResearchService = Depends(get_research_service),
 ) -> HealthResponse:
     db_ok = False
     try:
@@ -76,6 +82,20 @@ def healthcheck(
             metrics = openclaw_client.metrics_snapshot()
         except Exception:
             metrics = metrics
+    research_metrics: dict[str, int | dict[str, int]] = {
+        "research_jobs_total": 0,
+        "research_job_latency_ms": 0,
+        "research_cache_hit": 0,
+        "research_cache_miss": 0,
+        "research_export_success": 0,
+        "research_export_fail": 0,
+        "research_search_source_status": {},
+    }
+    if research_service and hasattr(research_service, "metrics_snapshot"):
+        try:
+            research_metrics = research_service.metrics_snapshot()
+        except Exception:
+            research_metrics = research_metrics
 
     return HealthResponse(
         db_ok=db_ok,
@@ -100,6 +120,13 @@ def healthcheck(
         openclaw_http_fail=int(metrics.get("openclaw_http_fail", 0)),
         openclaw_cli_fallback_count=int(metrics.get("openclaw_cli_fallback_count", 0)),
         openclaw_latency_ms=int(metrics.get("openclaw_latency_ms", 0)),
+        research_jobs_total=int(research_metrics.get("research_jobs_total", 0)),
+        research_job_latency_ms=int(research_metrics.get("research_job_latency_ms", 0)),
+        research_cache_hit=int(research_metrics.get("research_cache_hit", 0)),
+        research_cache_miss=int(research_metrics.get("research_cache_miss", 0)),
+        research_export_success=int(research_metrics.get("research_export_success", 0)),
+        research_export_fail=int(research_metrics.get("research_export_fail", 0)),
+        research_search_source_status=dict(research_metrics.get("research_search_source_status", {})),
     )
 
 

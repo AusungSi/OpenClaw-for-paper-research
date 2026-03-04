@@ -61,9 +61,27 @@ class ResearchTaskStatus(str, Enum):
 class ResearchJobType(str, Enum):
     PLAN = "plan"
     SEARCH = "search"
+    FULLTEXT = "fulltext"
+    GRAPH_BUILD = "graph_build"
 
 
 class ResearchJobStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+
+class ResearchPaperFulltextStatus(str, Enum):
+    NOT_STARTED = "not_started"
+    FETCHING = "fetching"
+    FETCHED = "fetched"
+    PARSED = "parsed"
+    FAILED = "failed"
+    NEED_UPLOAD = "need_upload"
+
+
+class ResearchGraphBuildStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     DONE = "done"

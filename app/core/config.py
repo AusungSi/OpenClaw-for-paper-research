@@ -94,6 +94,19 @@ class Settings(BaseSettings):
     research_page_size: int = 10
     research_sources_default: str = "semantic_scholar,arxiv"
     research_artifact_dir: str = "./artifacts/research"
+    research_cache_enabled: bool = True
+    research_cache_ttl_seconds: int = 86400
+    research_export_send_file: bool = True
+    research_metrics_enabled: bool = True
+    research_fulltext_enabled: bool = True
+    research_fulltext_max_file_mb: int = 30
+    research_fulltext_timeout_seconds: int = 45
+    research_fulltext_retries: int = 2
+    research_graph_enabled: bool = True
+    research_graph_depth_default: int = 1
+    research_graph_seed_topn: int = 20
+    research_graph_expand_limit_per_paper: int = 30
+    research_graph_viz_enabled: bool = True
     semantic_scholar_api_key: str = ""
 
 

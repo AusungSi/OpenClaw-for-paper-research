@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import mimetypes
 
 import httpx
 
@@ -81,6 +83,48 @@ class WeComClient:
         self._mark_send_ok()
         return True, None
 
+    def send_file(self, user_id: str, file_path: str) -> tuple[bool, str | None]:
+        if not user_id:
+            return self._mark_send_failed("config", "missing_user_id", "user id is empty")
+        path = Path(file_path).expanduser()
+        if not path.exists() or not path.is_file():
+            return self._mark_send_failed("config", "file_not_found", f"file not found: {path}")
+        try:
+            token = self._get_access_token()
+        except Exception as exc:
+            return self._mark_send_failed("config", "token_error", str(exc))
+
+        try:
+            media_id = self._upload_file(token=token, path=path)
+        except Exception as exc:
+            return self._mark_send_failed("network", "upload_error", str(exc))
+
+        url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+        payload = {
+            "touser": user_id,
+            "msgtype": "file",
+            "agentid": self.settings.wecom_agent_id,
+            "file": {"media_id": media_id},
+            "safe": 0,
+        }
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(url, params={"access_token": token}, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.TimeoutException as exc:
+            return self._mark_send_failed("network", "timeout", str(exc))
+        except httpx.HTTPError as exc:
+            return self._mark_send_failed("network", "http_error", str(exc))
+        except Exception as exc:
+            return self._mark_send_failed("unknown", "unexpected", str(exc))
+        if data.get("errcode") != 0:
+            errcode = str(data.get("errcode", "unknown"))
+            errmsg = str(data.get("errmsg", "unknown"))
+            return self._mark_send_failed("external", f"wecom_{errcode}", errmsg)
+        self._mark_send_ok()
+        return True, None
+
     def download_media(self, media_id: str) -> tuple[bytes, str | None]:
         if not media_id:
             raise RuntimeError("media_id is empty")
@@ -126,3 +170,23 @@ class WeComClient:
             message,
         )
         return False, error
+
+    def _upload_file(self, *, token: str, path: Path) -> str:
+        url = "https://qyapi.weixin.qq.com/cgi-bin/media/upload"
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        with path.open("rb") as fp:
+            files = {"media": (path.name, fp, mime_type)}
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    url,
+                    params={"access_token": token, "type": "file"},
+                    files=files,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+        if payload.get("errcode") != 0:
+            raise RuntimeError(f"upload_failed:{payload.get('errcode')}:{payload.get('errmsg')}")
+        media_id = payload.get("media_id")
+        if not isinstance(media_id, str) or not media_id.strip():
+            raise RuntimeError("upload_failed:missing_media_id")
+        return media_id.strip()

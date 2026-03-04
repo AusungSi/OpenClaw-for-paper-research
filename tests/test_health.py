@@ -82,6 +82,20 @@ class DummyOpenClaw:
         }
 
 
+class DummyResearchService:
+    @staticmethod
+    def metrics_snapshot():
+        return {
+            "research_jobs_total": 5,
+            "research_job_latency_ms": 66,
+            "research_cache_hit": 3,
+            "research_cache_miss": 2,
+            "research_export_success": 1,
+            "research_export_fail": 0,
+            "research_search_source_status": {"semantic_scholar:ok": 4},
+        }
+
+
 def fake_db():
     class _DB:
         def execute(self, _):
@@ -100,6 +114,7 @@ def test_health_extended_fields():
     app.state.asr_service = DummyAsr()
     app.state.reply_generation_service = DummyReplyGeneration()
     app.state.openclaw_client = DummyOpenClaw()
+    app.state.research_service = DummyResearchService()
     app.include_router(health_router)
     app.dependency_overrides[get_db] = fake_db
 
@@ -127,6 +142,13 @@ def test_health_extended_fields():
     assert body["openclaw_http_fail"] == 2
     assert body["openclaw_cli_fallback_count"] == 1
     assert body["openclaw_latency_ms"] == 88
+    assert body["research_jobs_total"] == 5
+    assert body["research_job_latency_ms"] == 66
+    assert body["research_cache_hit"] == 3
+    assert body["research_cache_miss"] == 2
+    assert body["research_export_success"] == 1
+    assert body["research_export_fail"] == 0
+    assert body["research_search_source_status"] == {"semantic_scholar:ok": 4}
 
 
 def test_capabilities_endpoint():
@@ -138,6 +160,7 @@ def test_capabilities_endpoint():
     app.state.intent_service = DummyIntent()
     app.state.asr_service = DummyAsr()
     app.state.reply_generation_service = DummyReplyGeneration()
+    app.state.research_service = DummyResearchService()
     app.include_router(health_router)
 
     client = TestClient(app)

@@ -11,8 +11,10 @@ from sqlalchemy.orm import Session
 from app.domain.enums import (
     PendingActionStatus,
     ReminderStatus,
+    ResearchGraphBuildStatus,
     ResearchJobStatus,
     ResearchJobType,
+    ResearchPaperFulltextStatus,
     ResearchTaskStatus,
     VoiceRecordStatus,
 )
@@ -23,7 +25,11 @@ from app.domain.models import (
     PendingAction,
     ResearchDirection,
     ResearchJob,
+    ResearchCitationEdge,
+    ResearchGraphSnapshot,
     ResearchPaper,
+    ResearchPaperFulltext,
+    ResearchSearchCache,
     ResearchSession,
     ResearchTask,
     RefreshToken,
@@ -568,6 +574,352 @@ class ResearchPaperRepo:
         stmt = select(ResearchPaper).where(ResearchPaper.task_id == task_id).order_by(ResearchPaper.id.asc())
         return list(self.db.execute(stmt).scalars().all())
 
+    def get_by_token(self, task_id: int, token: str) -> ResearchPaper | None:
+        token_str = (token or "").strip()
+        if not token_str:
+            return None
+        if token_str.isdigit():
+            row = self.db.get(ResearchPaper, int(token_str))
+            if row and row.task_id == task_id:
+                return row
+        stmt = select(ResearchPaper).where(
+            and_(
+                ResearchPaper.task_id == task_id,
+                ResearchPaper.paper_id == token_str,
+            )
+        )
+        row = self.db.execute(stmt).scalar_one_or_none()
+        if row:
+            return row
+        stmt = select(ResearchPaper).where(
+            and_(
+                ResearchPaper.task_id == task_id,
+                ResearchPaper.doi == token_str.lower(),
+            )
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+
+class ResearchPaperFulltextRepo:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get(self, task_id: int, paper_id: str) -> ResearchPaperFulltext | None:
+        stmt = select(ResearchPaperFulltext).where(
+            and_(
+                ResearchPaperFulltext.task_id == task_id,
+                ResearchPaperFulltext.paper_id == paper_id,
+            )
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def upsert(
+        self,
+        *,
+        task_id: int,
+        paper_id: str,
+        source_url: str | None = None,
+        status: str | None = None,
+        pdf_path: str | None = None,
+        text_path: str | None = None,
+        text_chars: int | None = None,
+        fail_reason: str | None = None,
+        fetched_at: datetime | None = None,
+        parsed_at: datetime | None = None,
+    ) -> ResearchPaperFulltext:
+        now = datetime.now(timezone.utc)
+        row = self.get(task_id, paper_id)
+        if row is None:
+            row = ResearchPaperFulltext(
+                task_id=task_id,
+                paper_id=paper_id,
+                source_url=source_url,
+                pdf_path=pdf_path,
+                text_path=text_path,
+                text_chars=max(0, int(text_chars or 0)),
+                status=ResearchPaperFulltextStatus(status or ResearchPaperFulltextStatus.NOT_STARTED.value),
+                fail_reason=fail_reason,
+                fetched_at=fetched_at,
+                parsed_at=parsed_at,
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(row)
+            self.db.flush()
+            return row
+        if source_url is not None:
+            row.source_url = source_url
+        if status is not None:
+            row.status = ResearchPaperFulltextStatus(status)
+        if pdf_path is not None:
+            row.pdf_path = pdf_path
+        if text_path is not None:
+            row.text_path = text_path
+        if text_chars is not None:
+            row.text_chars = max(0, int(text_chars))
+        row.fail_reason = fail_reason
+        if fetched_at is not None:
+            row.fetched_at = fetched_at
+        if parsed_at is not None:
+            row.parsed_at = parsed_at
+        row.updated_at = now
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def list_for_task(self, task_id: int) -> list[ResearchPaperFulltext]:
+        stmt = (
+            select(ResearchPaperFulltext)
+            .where(ResearchPaperFulltext.task_id == task_id)
+            .order_by(ResearchPaperFulltext.id.asc())
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def summary_for_task(self, task_id: int) -> dict[str, int]:
+        rows = self.list_for_task(task_id)
+        summary: dict[str, int] = {
+            "total": 0,
+            "parsed": 0,
+            "need_upload": 0,
+            "failed": 0,
+            "fetching": 0,
+            "fetched": 0,
+            "not_started": 0,
+        }
+        for row in rows:
+            key = str(row.status.value if hasattr(row.status, "value") else row.status)
+            summary["total"] += 1
+            summary[key] = summary.get(key, 0) + 1
+        return summary
+
+
+class ResearchCitationEdgeRepo:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def replace_for_task(self, task_id: int, edges: list[dict]) -> list[ResearchCitationEdge]:
+        self.db.query(ResearchCitationEdge).filter(ResearchCitationEdge.task_id == task_id).delete()
+        now = datetime.now(timezone.utc)
+        rows: list[ResearchCitationEdge] = []
+        for item in edges:
+            src = str(item.get("source") or "").strip()
+            dst = str(item.get("target") or "").strip()
+            edge_type = str(item.get("type") or "").strip() or "cites"
+            if not src or not dst:
+                continue
+            row = ResearchCitationEdge(
+                task_id=task_id,
+                src_paper_id=src[:128],
+                dst_paper_id=dst[:128],
+                edge_type=edge_type[:32],
+                source=str(item.get("source_name") or "semantic_scholar")[:64],
+                weight=float(item.get("weight") or 1.0),
+                created_at=now,
+            )
+            self.db.add(row)
+            rows.append(row)
+        self.db.flush()
+        return rows
+
+    def list_for_task(self, task_id: int) -> list[ResearchCitationEdge]:
+        stmt = select(ResearchCitationEdge).where(ResearchCitationEdge.task_id == task_id).order_by(ResearchCitationEdge.id.asc())
+        return list(self.db.execute(stmt).scalars().all())
+
+
+class ResearchGraphSnapshotRepo:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def upsert_snapshot(
+        self,
+        *,
+        task_id: int,
+        direction_index: int | None,
+        depth: int,
+        nodes: list[dict],
+        edges: list[dict],
+        stats: dict,
+        status: str,
+    ) -> ResearchGraphSnapshot:
+        now = datetime.now(timezone.utc)
+        stmt = (
+            select(ResearchGraphSnapshot)
+            .where(
+                and_(
+                    ResearchGraphSnapshot.task_id == task_id,
+                    ResearchGraphSnapshot.direction_index == direction_index,
+                )
+            )
+            .order_by(ResearchGraphSnapshot.updated_at.desc())
+            .limit(1)
+        )
+        row = self.db.execute(stmt).scalar_one_or_none()
+        if row is None:
+            row = ResearchGraphSnapshot(
+                task_id=task_id,
+                direction_index=direction_index,
+                depth=max(1, int(depth)),
+                nodes_json=orjson.dumps(nodes).decode("utf-8"),
+                edges_json=orjson.dumps(edges).decode("utf-8"),
+                stats_json=orjson.dumps(stats).decode("utf-8"),
+                status=ResearchGraphBuildStatus(status),
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(row)
+            self.db.flush()
+            return row
+        row.depth = max(1, int(depth))
+        row.nodes_json = orjson.dumps(nodes).decode("utf-8")
+        row.edges_json = orjson.dumps(edges).decode("utf-8")
+        row.stats_json = orjson.dumps(stats).decode("utf-8")
+        row.status = ResearchGraphBuildStatus(status)
+        row.updated_at = now
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def latest_for_task(self, task_id: int, direction_index: int | None = None) -> ResearchGraphSnapshot | None:
+        filters = [ResearchGraphSnapshot.task_id == task_id]
+        if direction_index is not None:
+            filters.append(ResearchGraphSnapshot.direction_index == direction_index)
+        stmt = (
+            select(ResearchGraphSnapshot)
+            .where(and_(*filters))
+            .order_by(ResearchGraphSnapshot.updated_at.desc(), ResearchGraphSnapshot.id.desc())
+            .limit(1)
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+
+class ResearchSearchCacheRepo:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_valid(
+        self,
+        *,
+        task_id: int,
+        direction_index: int,
+        source: str,
+        query_text: str,
+        year_from: int | None,
+        year_to: int | None,
+        top_n: int,
+        now: datetime | None = None,
+    ) -> list[dict] | None:
+        current = now or datetime.now(timezone.utc)
+        cache_key = self._cache_key(
+            task_id=task_id,
+            direction_index=direction_index,
+            source=source,
+            query_text=query_text,
+            year_from=year_from,
+            year_to=year_to,
+            top_n=top_n,
+        )
+        stmt = select(ResearchSearchCache).where(
+            and_(
+                ResearchSearchCache.cache_key == cache_key,
+                ResearchSearchCache.expires_at > current,
+            )
+        )
+        row = self.db.execute(stmt).scalar_one_or_none()
+        if not row:
+            return None
+        try:
+            data = orjson.loads(row.papers_json or "[]")
+        except Exception:
+            return None
+        if not isinstance(data, list):
+            return None
+        return [item for item in data if isinstance(item, dict)]
+
+    def upsert(
+        self,
+        *,
+        task_id: int,
+        direction_index: int,
+        source: str,
+        query_text: str,
+        year_from: int | None,
+        year_to: int | None,
+        top_n: int,
+        papers: list[dict],
+        ttl_seconds: int,
+    ) -> ResearchSearchCache:
+        now = datetime.now(timezone.utc)
+        cache_key = self._cache_key(
+            task_id=task_id,
+            direction_index=direction_index,
+            source=source,
+            query_text=query_text,
+            year_from=year_from,
+            year_to=year_to,
+            top_n=top_n,
+        )
+        stmt = select(ResearchSearchCache).where(ResearchSearchCache.cache_key == cache_key)
+        row = self.db.execute(stmt).scalar_one_or_none()
+        expires_at = now + timedelta(seconds=max(1, int(ttl_seconds)))
+        payload_json = orjson.dumps(papers).decode("utf-8")
+        if row is None:
+            row = ResearchSearchCache(
+                task_id=task_id,
+                direction_index=direction_index,
+                source=source[:64],
+                query_text=query_text[:4000],
+                year_from=year_from,
+                year_to=year_to,
+                top_n=top_n,
+                cache_key=cache_key,
+                papers_json=payload_json,
+                papers_count=len(papers),
+                expires_at=expires_at,
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(row)
+            self.db.flush()
+            return row
+        row.task_id = task_id
+        row.direction_index = direction_index
+        row.source = source[:64]
+        row.query_text = query_text[:4000]
+        row.year_from = year_from
+        row.year_to = year_to
+        row.top_n = top_n
+        row.papers_json = payload_json
+        row.papers_count = len(papers)
+        row.expires_at = expires_at
+        row.updated_at = now
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    @staticmethod
+    def _cache_key(
+        *,
+        task_id: int,
+        direction_index: int,
+        source: str,
+        query_text: str,
+        year_from: int | None,
+        year_to: int | None,
+        top_n: int,
+    ) -> str:
+        raw = "|".join(
+            [
+                str(task_id),
+                str(direction_index),
+                source.strip().lower(),
+                query_text.strip().lower(),
+                str(year_from or ""),
+                str(year_to or ""),
+                str(top_n),
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 class ResearchJobRepo:
     def __init__(self, db: Session):
@@ -607,6 +959,39 @@ class ResearchJobRepo:
                 )
             )
             .order_by(ResearchJob.created_at.asc())
+            .limit(1)
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def latest_for_task(self, task_id: int) -> ResearchJob | None:
+        stmt = (
+            select(ResearchJob)
+            .where(ResearchJob.task_id == task_id)
+            .order_by(ResearchJob.created_at.desc(), ResearchJob.id.desc())
+            .limit(1)
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def has_pending(self, task_id: int, job_type: ResearchJobType) -> bool:
+        stmt = select(ResearchJob.id).where(
+            and_(
+                ResearchJob.task_id == task_id,
+                ResearchJob.job_type == job_type,
+                ResearchJob.status.in_([ResearchJobStatus.QUEUED, ResearchJobStatus.RUNNING]),
+            )
+        )
+        return self.db.execute(stmt).first() is not None
+
+    def next_retry_for_task(self, task_id: int) -> ResearchJob | None:
+        stmt = (
+            select(ResearchJob)
+            .where(
+                and_(
+                    ResearchJob.task_id == task_id,
+                    ResearchJob.status == ResearchJobStatus.QUEUED,
+                )
+            )
+            .order_by(ResearchJob.scheduled_at.asc(), ResearchJob.id.asc())
             .limit(1)
         )
         return self.db.execute(stmt).scalar_one_or_none()
