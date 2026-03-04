@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from app.core.config import get_settings
+from app.domain.enums import ResearchJobStatus
+from app.domain.models import ResearchJob
+from app.infra.repos import ResearchTaskRepo, UserRepo
 from app.llm.openclaw_client import LLMCallResult, LLMTaskType
 from app.services.research_command_service import ResearchCommandService
 from app.services.research_service import ResearchService
-from app.infra.repos import UserRepo
 
 
 class FakeOpenClawClient:
@@ -133,3 +137,49 @@ def test_research_flow_create_plan_search_and_select(db_session):
         assert "Reducing Hallucination" in captured[0]
     finally:
         settings.research_enabled = original_research_enabled
+
+
+def test_research_job_retry_then_fail(db_session):
+    settings = get_settings()
+    original_max_attempts = settings.research_job_max_attempts
+    original_backoff = settings.research_job_backoff_seconds
+    try:
+        settings.research_job_max_attempts = 2
+        settings.research_job_backoff_seconds = 1
+
+        service = ResearchService(openclaw_client=FakeOpenClawClient(), wecom_client=None)
+        user = UserRepo(db_session).get_or_create("research-retry-user", timezone_name="Asia/Shanghai")
+        task = service.create_task(
+            db_session,
+            user_id=user.id,
+            topic="retry topic",
+            constraints={},
+        )
+
+        def fail_plan(topic: str, constraints: dict):
+            raise RuntimeError("plan boom")
+
+        service._plan_directions = fail_plan
+
+        processed = service.process_one_job(db_session)
+        assert processed == 1
+
+        first_job = db_session.query(ResearchJob).filter(ResearchJob.task_id == task.id).one()
+        assert first_job.status == ResearchJobStatus.QUEUED
+        assert first_job.attempts == 1
+        assert ResearchTaskRepo(db_session).get_by_task_id(task.task_id, user_id=user.id).status.value == "planning"
+
+        first_job.scheduled_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db_session.add(first_job)
+        db_session.flush()
+
+        processed = service.process_one_job(db_session)
+        assert processed == 1
+
+        failed_job = db_session.query(ResearchJob).filter(ResearchJob.task_id == task.id).one()
+        assert failed_job.status == ResearchJobStatus.FAILED
+        assert failed_job.attempts == 2
+        assert ResearchTaskRepo(db_session).get_by_task_id(task.task_id, user_id=user.id).status.value == "failed"
+    finally:
+        settings.research_job_max_attempts = original_max_attempts
+        settings.research_job_backoff_seconds = original_backoff

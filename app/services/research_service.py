@@ -117,12 +117,30 @@ class ResearchService:
             job_repo.mark_done(job)
         except Exception as exc:
             logger.exception("research_job_failed task_id=%s job_id=%s", task.task_id, job.id)
-            task.status = ResearchTaskStatus.FAILED
-            task.updated_at = datetime.now(timezone.utc)
-            db.add(task)
-            db.flush()
-            job_repo.mark_failed(job, str(exc))
-            self._notify_user(db, task.user_id, f"调研任务 {task.task_id} 失败：{str(exc)[:120]}")
+            max_attempts = max(1, int(self.settings.research_job_max_attempts))
+            if job.attempts < max_attempts:
+                base_delay = max(1, int(self.settings.research_job_backoff_seconds))
+                delay_seconds = min(300, base_delay * (2 ** max(0, job.attempts - 1)))
+                task.status = self._task_status_for_retry(job.job_type)
+                task.updated_at = datetime.now(timezone.utc)
+                db.add(task)
+                db.flush()
+                job_repo.mark_retry(job, error=str(exc), delay_seconds=delay_seconds)
+                logger.warning(
+                    "research_job_retry_scheduled task_id=%s job_id=%s attempt=%s/%s delay_s=%s",
+                    task.task_id,
+                    job.id,
+                    job.attempts,
+                    max_attempts,
+                    delay_seconds,
+                )
+            else:
+                task.status = ResearchTaskStatus.FAILED
+                task.updated_at = datetime.now(timezone.utc)
+                db.add(task)
+                db.flush()
+                job_repo.mark_failed(job, str(exc))
+                self._notify_user(db, task.user_id, f"调研任务 {task.task_id} 失败：{str(exc)[:120]}")
         return 1
 
     def get_active_task(self, db: Session, user_id: int) -> ResearchTask | None:
@@ -612,6 +630,12 @@ class ResearchService:
         ok, error = self.wecom_client.send_text(user.wecom_user_id, content)
         if not ok:
             logger.warning("research_notify_failed user_id=%s error=%s", user_id, error)
+
+    @staticmethod
+    def _task_status_for_retry(job_type: ResearchJobType) -> ResearchTaskStatus:
+        if job_type == ResearchJobType.PLAN:
+            return ResearchTaskStatus.PLANNING
+        return ResearchTaskStatus.SEARCHING
 
     @staticmethod
     def _render_report(task: ResearchTask, directions: list, papers: list) -> str:

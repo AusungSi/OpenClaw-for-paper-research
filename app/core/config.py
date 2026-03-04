@@ -86,6 +86,8 @@ class Settings(BaseSettings):
 
     research_enabled: bool = False
     research_job_interval_seconds: int = 20
+    research_job_max_attempts: int = 3
+    research_job_backoff_seconds: int = 10
     research_direction_min: int = 3
     research_direction_max: int = 8
     research_topn_default: int = 20

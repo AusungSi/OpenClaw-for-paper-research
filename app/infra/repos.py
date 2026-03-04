@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import orjson
 from sqlalchemy.exc import IntegrityError
@@ -636,6 +636,18 @@ class ResearchJobRepo:
         row.status = ResearchJobStatus.FAILED
         row.error = error[:2000]
         row.finished_at = now
+        row.updated_at = now
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def mark_retry(self, row: ResearchJob, *, error: str, delay_seconds: int) -> ResearchJob:
+        now = datetime.now(timezone.utc)
+        row.status = ResearchJobStatus.QUEUED
+        row.error = error[:2000]
+        row.scheduled_at = now + timedelta(seconds=max(1, delay_seconds))
+        row.started_at = None
+        row.finished_at = None
         row.updated_at = now
         self.db.add(row)
         self.db.flush()
