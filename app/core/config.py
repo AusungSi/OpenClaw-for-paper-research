@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     openclaw_timeout_seconds: int = 30
     openclaw_retries: int = 2
     openclaw_cli_path: str = "~/.openclaw/bin/openclaw"
+    openclaw_cli_fallback_enabled: bool = True
 
     research_enabled: bool = False
     research_job_interval_seconds: int = 20
@@ -97,9 +98,13 @@ class Settings(BaseSettings):
     research_direction_min: int = 3
     research_direction_max: int = 8
     research_topn_default: int = 20
+    research_seed_topn_default: int = 60
+    research_seed_max_abstract_chars: int = 600
+    research_round_topn_default: int = 12
     research_page_size: int = 10
     research_sources_default: str = "semantic_scholar,arxiv"
     research_artifact_dir: str = "./artifacts/research"
+    research_save_base_dir: str = "./artifacts/research/saved"
     research_cache_enabled: bool = True
     research_cache_ttl_seconds: int = 86400
     research_export_send_file: bool = True
@@ -122,6 +127,9 @@ class Settings(BaseSettings):
     research_wecom_lite_mode: bool = True
     research_web_base_url: str = ""
     research_ocr_enabled: bool = False
+    research_graph_paper_limit_default: int = 8
+    research_summary_enabled: bool = True
+    research_summary_max_chars: int = 8000
     semantic_scholar_api_key: str = ""
 
 

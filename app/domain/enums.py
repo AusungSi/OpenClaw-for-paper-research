@@ -63,6 +63,7 @@ class ResearchJobType(str, Enum):
     SEARCH = "search"
     FULLTEXT = "fulltext"
     GRAPH_BUILD = "graph_build"
+    PAPER_SUMMARY = "paper_summary"
 
 
 class ResearchJobStatus(str, Enum):

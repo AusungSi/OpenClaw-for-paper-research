@@ -38,6 +38,7 @@ from app.infra.repos import (
     ResearchRoundCandidateRepo,
     ResearchRoundPaperRepo,
     ResearchRoundRepo,
+    ResearchSeedPaperRepo,
     ResearchSearchCacheRepo,
     ResearchSessionRepo,
     ResearchTaskRepo,
@@ -112,7 +113,8 @@ class ResearchService:
         task_repo = ResearchTaskRepo(db)
         session_repo = ResearchSessionRepo(db)
         now = datetime.now(timezone.utc)
-        task_id = self._next_task_id(task_repo.list_recent(user_id, limit=100))
+        # Use global recent tasks to avoid collisions across users.
+        task_id = self._next_task_id(task_repo.list_recent_all(limit=500))
         row = ResearchTask(
             task_id=task_id,
             user_id=user_id,
@@ -280,7 +282,7 @@ class ResearchService:
         )
         payload = {
             "direction_index": direction_index,
-            "top_n": top_n or self.settings.research_topn_default,
+            "top_n": top_n or self.settings.research_round_topn_default,
             "force_refresh": False,
             "round_id": round_row.id,
             "explicit_queries": query_terms[:4],
@@ -391,10 +393,71 @@ class ResearchService:
         )
         payload = {
             "direction_index": parent.direction_index,
-            "top_n": top_n or self.settings.research_topn_default,
+            "top_n": top_n or self.settings.research_round_topn_default,
             "force_refresh": bool(force_refresh),
             "round_id": child.id,
             "explicit_queries": _load_json_list(candidate.queries_json),
+        }
+        ResearchJobRepo(db).enqueue(task.id, ResearchJobType.SEARCH, payload, queue_name=self.settings.research_queue_name)
+        task.status = ResearchTaskStatus.SEARCHING
+        task.updated_at = datetime.now(timezone.utc)
+        db.add(task)
+        db.flush()
+        return {
+            "task_id": task.task_id,
+            "parent_round_id": parent.id,
+            "child_round_id": child.id,
+            "status": task.status.value,
+            "queued": True,
+        }
+
+    def create_next_round_from_intent(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        round_id: int,
+        intent_text: str,
+        top_n: int | None = None,
+        force_refresh: bool = False,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        parent = ResearchRoundRepo(db).get(round_id)
+        if not parent or parent.task_id != task.id:
+            raise ValueError("round not found")
+        intent = (intent_text or "").strip()
+        if not intent:
+            raise ValueError("intent_text is required")
+        max_rounds = max(1, int(self.settings.research_max_rounds))
+        if parent.depth >= max_rounds:
+            raise ValueError(f"max rounds reached ({max_rounds})")
+
+        direction = ResearchDirectionRepo(db).get_by_index(task.id, parent.direction_index)
+        references = self._round_reference_titles(db, round_id=parent.id, limit=8)
+        queries = self._generate_queries_from_intent(
+            task_topic=task.topic,
+            direction_name=direction.name if direction else "",
+            intent_text=intent,
+            current_queries=_load_json_list(parent.query_terms_json),
+            references=references,
+        )
+        child = ResearchRoundRepo(db).create(
+            task_id=task.id,
+            direction_index=parent.direction_index,
+            parent_round_id=parent.id,
+            depth=parent.depth + 1,
+            action=parent.action.value,
+            feedback_text=intent,
+            query_terms=queries[:4],
+            status=ResearchRoundStatus.QUEUED.value,
+        )
+        payload = {
+            "direction_index": parent.direction_index,
+            "top_n": top_n or self.settings.research_round_topn_default,
+            "force_refresh": bool(force_refresh),
+            "round_id": child.id,
+            "explicit_queries": queries[:4],
         }
         ResearchJobRepo(db).enqueue(task.id, ResearchJobType.SEARCH, payload, queue_name=self.settings.research_queue_name)
         task.status = ResearchTaskStatus.SEARCHING
@@ -450,9 +513,11 @@ class ResearchService:
         *,
         user_id: int,
         task_id: str,
+        include_papers: bool = False,
+        paper_limit: int | None = None,
     ) -> dict:
         task = self.switch_task(db, user_id=user_id, task_id=task_id)
-        return self._build_tree_graph(db, task)
+        return self._build_tree_graph(db, task, include_papers=include_papers, paper_limit=paper_limit)
 
     def list_graph_snapshots(
         self,
@@ -544,6 +609,8 @@ class ResearchService:
                 self._run_fulltext_job(db, task, payload, touch_lease=touch_lease)
             elif job.job_type == ResearchJobType.GRAPH_BUILD:
                 self._run_graph_job(db, task, payload, touch_lease=touch_lease)
+            elif job.job_type == ResearchJobType.PAPER_SUMMARY:
+                self._run_paper_summary_job(db, task, payload, touch_lease=touch_lease)
             else:
                 raise ValueError(f"unsupported job type: {job.job_type}")
             job_repo.mark_done(job)
@@ -693,6 +760,139 @@ class ResearchService:
             "text_chars": row.text_chars,
         }
 
+    def get_paper_detail(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        paper_token: str,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        paper = ResearchPaperRepo(db).get_by_token(task.id, paper_token)
+        if not paper:
+            raise ValueError("paper not found")
+        paper_id = _paper_token(paper)
+        fulltext = ResearchPaperFulltextRepo(db).get(task.id, paper_id)
+        return {
+            "task_id": task.task_id,
+            "paper_id": paper_id,
+            "title": paper.title,
+            "authors": _load_json_list(paper.authors_json),
+            "year": paper.year,
+            "venue": paper.venue,
+            "doi": paper.doi,
+            "url": paper.url,
+            "abstract": paper.abstract,
+            "method_summary": paper.method_summary,
+            "source": paper.source,
+            "fulltext_status": fulltext.status.value if fulltext else None,
+            "saved": bool(paper.saved),
+            "saved_path": paper.saved_path,
+            "saved_bib_path": paper.saved_bib_path,
+            "saved_at": paper.saved_at,
+            "key_points_status": paper.key_points_status or "none",
+            "key_points_source": paper.key_points_source,
+            "key_points": paper.key_points,
+            "key_points_error": paper.key_points_error,
+            "key_points_updated_at": paper.key_points_updated_at,
+        }
+
+    def list_saved_papers(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        limit: int = 200,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        rows = ResearchPaperRepo(db).list_saved_for_task(task.id, limit=limit)
+        return {
+            "task_id": task.task_id,
+            "items": [
+                {
+                    "paper_id": _paper_token(row),
+                    "title": row.title,
+                    "year": row.year,
+                    "doi": row.doi,
+                    "saved_path": row.saved_path,
+                    "saved_bib_path": row.saved_bib_path,
+                    "saved_at": row.saved_at,
+                }
+                for row in rows
+            ],
+        }
+
+    def save_paper(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        paper_token: str,
+        subdir: str | None = None,
+    ) -> dict:
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        paper_repo = ResearchPaperRepo(db)
+        paper = paper_repo.get_by_token(task.id, paper_token)
+        if not paper:
+            raise ValueError("paper not found")
+        base_dir = Path(self.settings.research_save_base_dir).expanduser().resolve()
+        safe_subdir = (subdir or "").strip()
+        if safe_subdir:
+            p = Path(safe_subdir)
+            if p.is_absolute() or ".." in p.parts:
+                raise ValueError("invalid subdir")
+        target_dir = (base_dir / safe_subdir / task.task_id).resolve()
+        if not str(target_dir).startswith(str(base_dir)):
+            raise ValueError("invalid subdir")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        paper_key = re.sub(r"[^a-zA-Z0-9._-]+", "_", _paper_token(paper))[:120] or f"paper_{paper.id}"
+        md_path = target_dir / f"{paper_key}.md"
+        bib_path = target_dir / f"{paper_key}.bib"
+        md_path.write_text(self._render_saved_paper_markdown(task, paper), encoding="utf-8")
+        bib_path.write_text(self._render_bib([paper]), encoding="utf-8")
+        row = paper_repo.mark_saved(paper, md_path=str(md_path), bib_path=str(bib_path))
+        return {
+            "task_id": task.task_id,
+            "paper_id": _paper_token(row),
+            "saved": bool(row.saved),
+            "saved_path": str(md_path),
+            "saved_bib_path": str(bib_path),
+            "saved_at": row.saved_at,
+        }
+
+    def enqueue_paper_summary(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        task_id: str,
+        paper_token: str,
+    ) -> dict:
+        if not self.settings.research_summary_enabled:
+            raise ValueError("research summary is disabled")
+        task = self.switch_task(db, user_id=user_id, task_id=task_id)
+        paper_repo = ResearchPaperRepo(db)
+        paper = paper_repo.get_by_token(task.id, paper_token)
+        if not paper:
+            raise ValueError("paper not found")
+        paper_repo.update_key_points(paper, status="queued", error=None)
+        payload = {"paper_token": _paper_token(paper)}
+        ResearchJobRepo(db).enqueue(task.id, ResearchJobType.PAPER_SUMMARY, payload, queue_name=self.settings.research_queue_name)
+        task.status = ResearchTaskStatus.SEARCHING
+        task.updated_at = datetime.now(timezone.utc)
+        db.add(task)
+        db.flush()
+        return {
+            "task_id": task.task_id,
+            "paper_id": _paper_token(paper),
+            "key_points_status": "queued",
+            "queued": True,
+        }
+
     def get_graph_snapshot(
         self,
         db: Session,
@@ -702,11 +902,13 @@ class ResearchService:
         direction_index: int | None = None,
         round_id: int | None = None,
         view: str = ResearchGraphViewType.CITATION.value,
+        include_papers: bool = False,
+        paper_limit: int | None = None,
     ) -> dict:
         task = self.switch_task(db, user_id=user_id, task_id=task_id)
         view_norm = (view or ResearchGraphViewType.CITATION.value).strip().lower()
         if view_norm == ResearchGraphViewType.TREE.value:
-            data = self._build_tree_graph(db, task)
+            data = self._build_tree_graph(db, task, include_papers=include_papers, paper_limit=paper_limit)
             return {"task_id": task.task_id, "view": view_norm, **data}
         row = ResearchGraphSnapshotRepo(db).latest_for_task(
             task.id,
@@ -777,6 +979,7 @@ class ResearchService:
                     "abstract": row.abstract,
                     "method_summary": row.method_summary,
                     "source": row.source,
+                    "saved": bool(row.saved),
                 }
             )
         return {
@@ -872,7 +1075,8 @@ class ResearchService:
         touch_lease: Callable[[], None] | None = None,
     ) -> None:
         constraints = _load_json_dict(task.constraints_json)
-        directions = self._plan_directions(task.topic, constraints)
+        seed_rows = self._build_seed_corpus_for_task(db, task=task, constraints=constraints)
+        directions = self._plan_directions_from_seed(task.topic, constraints, seed_rows)
         ResearchDirectionRepo(db).replace_for_task(task, directions)
         task.status = ResearchTaskStatus.CREATED
         task.updated_at = datetime.now(timezone.utc)
@@ -1290,6 +1494,61 @@ class ResearchService:
                 "回复“调研 图谱 查看”查看。"
             ),
         )
+
+    def _run_paper_summary_job(
+        self,
+        db: Session,
+        task: ResearchTask,
+        payload: dict,
+        *,
+        touch_lease: Callable[[], None] | None = None,
+    ) -> None:
+        paper_token = str(payload.get("paper_token") or "").strip()
+        if not paper_token:
+            raise ValueError("paper_token is required")
+        paper_repo = ResearchPaperRepo(db)
+        paper = paper_repo.get_by_token(task.id, paper_token)
+        if not paper:
+            raise ValueError("paper not found")
+        paper_repo.update_key_points(paper, status="running", error=None)
+        paper_key = _paper_token(paper)
+        fulltext = ResearchPaperFulltextRepo(db).get(task.id, paper_key)
+        source = "abstract"
+        text = (paper.abstract or "").strip()
+        if fulltext and fulltext.text_path:
+            try:
+                p = Path(fulltext.text_path)
+                if p.exists():
+                    raw = p.read_text(encoding="utf-8", errors="ignore")
+                    if raw.strip():
+                        source = "fulltext"
+                        text = raw.strip()
+            except Exception:
+                logger.exception("paper_summary_read_fulltext_failed paper=%s", paper_key)
+        if not text:
+            paper_repo.update_key_points(paper, status="failed", error="no_text_for_summary")
+            raise ValueError("no text available for summary")
+        if touch_lease:
+            touch_lease()
+        points = self._summarize_key_points(text=text, source=source)
+        paper_repo.update_key_points(
+            paper,
+            status="done",
+            key_points=points,
+            source=source,
+            error=None,
+        )
+        if paper.saved and paper.saved_path:
+            try:
+                md_path = Path(paper.saved_path)
+                md_path.parent.mkdir(parents=True, exist_ok=True)
+                md_path.write_text(self._render_saved_paper_markdown(task, paper), encoding="utf-8")
+            except Exception:
+                logger.exception("paper_summary_refresh_saved_file_failed paper=%s", paper_key)
+        task.status = ResearchTaskStatus.DONE
+        task.updated_at = datetime.now(timezone.utc)
+        db.add(task)
+        db.flush()
 
     def _search_with_cache(
         self,
@@ -1757,6 +2016,66 @@ class ResearchService:
         rows = ResearchPaperRepo(db).list_by_ids(paper_ids)
         return [row.title for row in rows if row.title][:limit]
 
+    def _generate_queries_from_intent(
+        self,
+        *,
+        task_topic: str,
+        direction_name: str,
+        intent_text: str,
+        current_queries: list[str],
+        references: list[str],
+    ) -> list[str]:
+        prompt = (
+            "你是 memomate-research-planner，请根据用户意图生成下一轮检索 query。"
+            '返回严格 JSON: {"queries":["q1","q2","q3"]}。\n\n'
+            f"Topic: {task_topic}\n"
+            f"Direction: {direction_name}\n"
+            f"User intent: {intent_text}\n"
+            f"Current queries: {orjson.dumps(current_queries).decode('utf-8')}\n"
+            f"Reference titles: {orjson.dumps(references).decode('utf-8')}\n"
+            "Rules: return 2-4 concise, non-duplicate queries."
+        )
+        try:
+            result = self.openclaw_client.chat_completion(
+                task_type=LLMTaskType.RESEARCH_PLAN,
+                prompt=prompt,
+                system_prompt="Return strict JSON only.",
+                temperature=0.1,
+                max_tokens=500,
+            )
+            data = _extract_first_json_object((result.text or "").strip())
+            queries = [str(x).strip() for x in (data or {}).get("queries", []) if str(x).strip()]
+            dedup: list[str] = []
+            seen: set[str] = set()
+            for q in queries:
+                key = q.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                dedup.append(q)
+            if len(dedup) >= 2:
+                return dedup[:4]
+        except Exception:
+            logger.exception("research_intent_to_queries_failed")
+
+        base = intent_text.strip()[:200] or task_topic.strip()
+        out = [base]
+        if direction_name.strip():
+            out.append(f"{direction_name.strip()} {base}")
+        if task_topic.strip():
+            out.append(f"{task_topic.strip()} {base}")
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for q in out:
+            key = q.lower().strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            dedup.append(q.strip())
+        if len(dedup) < 2:
+            dedup.append(f"{base} methods")
+        return dedup[:4]
+
     def _generate_round_candidates(
         self,
         *,
@@ -1827,13 +2146,25 @@ class ResearchService:
             out.append({"name": name, "queries": queries[:4], "reason": reason})
         return out
 
-    def _build_tree_graph(self, db: Session, task: ResearchTask) -> dict:
+    def _build_tree_graph(
+        self,
+        db: Session,
+        task: ResearchTask,
+        *,
+        include_papers: bool = False,
+        paper_limit: int | None = None,
+    ) -> dict:
         round_repo = ResearchRoundRepo(db)
         round_rows = round_repo.list_for_task(task.id)
         direction_rows = ResearchDirectionRepo(db).list_for_task(task.id)
         direction_map = {row.direction_index: row for row in direction_rows}
         round_paper_repo = ResearchRoundPaperRepo(db)
         paper_repo = ResearchPaperRepo(db)
+        fulltext_map = {
+            row.paper_id: row.status.value
+            for row in ResearchPaperFulltextRepo(db).list_for_task(task.id)
+            if row.paper_id
+        }
 
         nodes: dict[str, dict] = {}
         edges: list[dict] = []
@@ -1855,16 +2186,28 @@ class ResearchService:
                 edges.append({"source": topic_id, "target": d_id, "type": "topic_direction", "weight": 1.0})
                 seen.add(key)
 
+        per_round_paper_limit = max(
+            1,
+            min(
+                50,
+                int(paper_limit or self.settings.research_graph_paper_limit_default),
+            ),
+        )
+
         for row in round_rows:
             r_id = f"round:{row.id}"
+            feedback_short = (row.feedback_text or "").strip()
+            if feedback_short:
+                feedback_short = re.sub(r"\s+", " ", feedback_short)[:18]
             nodes[r_id] = {
                 "id": r_id,
                 "type": "round",
-                "label": f"Round {row.depth}",
+                "label": f"第{row.depth}轮" + (f" · {feedback_short}" if feedback_short else ""),
                 "direction_index": row.direction_index,
                 "depth": row.depth,
                 "action": row.action.value,
                 "status": row.status.value,
+                "feedback_text": row.feedback_text,
                 "source": "memomate",
             }
             if row.parent_round_id:
@@ -1882,25 +2225,36 @@ class ResearchService:
                         edges.append({"source": d_id, "target": r_id, "type": "direction_round", "weight": 1.0})
                         seen.add(key)
 
-            refs = round_paper_repo.list_for_round(row.id)[:20]
-            papers = paper_repo.list_by_ids([x.paper_id for x in refs])
-            rank = {x.paper_id: x.rank for x in refs}
-            papers.sort(key=lambda p: rank.get(p.id, 999999))
-            for paper in papers:
-                p_id = _paper_token(paper)
-                if p_id not in nodes:
-                    nodes[p_id] = {
-                        "id": p_id,
-                        "type": "paper",
-                        "label": paper.title[:240],
-                        "year": paper.year,
-                        "source": paper.source,
-                        "direction_index": row.direction_index,
-                    }
-                key = (r_id, p_id, "round_paper")
-                if key not in seen:
-                    edges.append({"source": r_id, "target": p_id, "type": "round_paper", "weight": 1.0})
-                    seen.add(key)
+            if include_papers:
+                refs = round_paper_repo.list_for_round(row.id)[:per_round_paper_limit]
+                papers = paper_repo.list_by_ids([x.paper_id for x in refs])
+                rank = {x.paper_id: x.rank for x in refs}
+                papers.sort(key=lambda p: rank.get(p.id, 999999))
+                for paper in papers:
+                    p_id = _paper_token(paper)
+                    if p_id not in nodes:
+                        nodes[p_id] = {
+                            "id": p_id,
+                            "paper_id": p_id,
+                            "type": "paper",
+                            "label": paper.title[:240],
+                            "year": paper.year,
+                            "source": paper.source,
+                            "venue": paper.venue,
+                            "doi": paper.doi,
+                            "url": paper.url,
+                            "abstract": paper.abstract,
+                            "method_summary": paper.method_summary,
+                            "authors": _load_json_list(paper.authors_json),
+                            "direction_index": row.direction_index,
+                            "fulltext_status": fulltext_map.get(p_id),
+                            "saved": bool(paper.saved),
+                            "key_points_status": paper.key_points_status,
+                        }
+                    key = (r_id, p_id, "round_paper")
+                    if key not in seen:
+                        edges.append({"source": r_id, "target": p_id, "type": "round_paper", "weight": 1.0})
+                        seen.add(key)
 
         return {
             "direction_index": None,
@@ -1913,8 +2267,87 @@ class ResearchService:
                 "node_count": len(nodes),
                 "edge_count": len(edges),
                 "round_count": len(round_rows),
+                "paper_limit_applied": per_round_paper_limit if include_papers else 0,
             },
         }
+
+    def _build_seed_corpus_for_task(self, db: Session, *, task: ResearchTask, constraints: dict) -> list:
+        top_n = max(10, min(120, int(self.settings.research_seed_topn_default)))
+        constraints_seed = {
+            "year_from": constraints.get("year_from"),
+            "year_to": constraints.get("year_to"),
+            "sources": constraints.get("sources"),
+        }
+        sources = _resolve_sources(constraints_seed.get("sources"), self.settings.research_sources_default)
+        ordered_sources = [src for src in ("semantic_scholar", "arxiv") if src in sources] or ["semantic_scholar", "arxiv"]
+
+        collected: list[dict] = []
+        per_source = max(10, min(100, top_n))
+        for source in ordered_sources:
+            fetched = self._search_by_source(
+                source=source,
+                query=task.topic,
+                top_n=per_source,
+                constraints=constraints_seed,
+                allow_semantic_fallback=True,
+            )
+            self._record_source_status(source, fetched.status)
+            if fetched.papers:
+                collected.extend(fetched.papers)
+            if len(collected) >= top_n * 2:
+                break
+        deduped = self._dedupe_papers(collected)[:top_n]
+        return ResearchSeedPaperRepo(db).replace_for_task(task.id, deduped)
+
+    def _plan_directions_from_seed(self, topic: str, constraints: dict, seed_rows: list) -> list[dict]:
+        if not seed_rows:
+            return self._plan_directions(topic, constraints)
+        max_abs = max(120, int(self.settings.research_seed_max_abstract_chars))
+        snippets = []
+        for idx, row in enumerate(seed_rows[:40], start=1):
+            title = str(getattr(row, "title", "") or "").strip()
+            abstract = str(getattr(row, "abstract", "") or "").strip()
+            year = getattr(row, "year", None)
+            source = str(getattr(row, "source", "") or "")
+            if not title:
+                continue
+            snippets.append(
+                {
+                    "i": idx,
+                    "title": title[:200],
+                    "year": year,
+                    "source": source,
+                    "abstract": abstract[:max_abs],
+                }
+            )
+        if not snippets:
+            return self._plan_directions(topic, constraints)
+
+        direction_min = max(1, int(self.settings.research_direction_min))
+        direction_max = max(direction_min, int(self.settings.research_direction_max))
+        prompt = (
+            "你是 memomate-research-planner。请基于给定论文集合归纳研究方向。"
+            '返回严格 JSON: {"directions":[{"name":"...","queries":["q1","q2"],"exclude_terms":["x"]}]}\n'
+            f"Topic: {topic}\n"
+            f"Directions count: {direction_min}-{direction_max}\n"
+            "Rules: 方向必须是互斥的方法流派（如 encoder-decoder, VLM, agentic pipeline 等），"
+            "不要给同义方向，不要给数据集或评测维度当方向。每个方向 query 2-4 条。\n"
+            f"Papers:\n{orjson.dumps(snippets).decode('utf-8')}"
+        )
+        try:
+            result = self.openclaw_client.chat_completion(
+                task_type=LLMTaskType.RESEARCH_PLAN,
+                prompt=prompt,
+                system_prompt="Return strict JSON only.",
+                temperature=0.2,
+                max_tokens=1600,
+            )
+            directions = self._parse_direction_json(result)
+            if directions:
+                return directions
+        except Exception:
+            logger.exception("research_plan_from_seed_failed")
+        return self._plan_directions(topic, constraints)
 
     def _plan_directions(self, topic: str, constraints: dict) -> list[dict]:
         direction_min = max(1, int(self.settings.research_direction_min))
@@ -1930,7 +2363,11 @@ class ResearchService:
             f"{orjson.dumps(constraints).decode('utf-8')}\n\n"
             "Return JSON schema:\n"
             '{"directions":[{"name":"string","queries":["q1","q2"],"exclude_terms":["x"]}]}\n'
-            f"Rules: directions count must be {direction_min}-{direction_max}; each direction queries count 2-4."
+            f"Rules: directions count must be {direction_min}-{direction_max}; each direction queries count 2-4.\n"
+            "Directions must be mutually exclusive solution routes / methodological paradigms. "
+            "Do NOT output mere aspects (e.g., data, evaluation, ablations, noise) of the same approach. "
+            "Avoid near-duplicate or synonymous directions. Prefer distinct pipelines such as "
+            "generative, retrieval-augmented, template/rule-based, multi-stage, or hybrid."
         )
         try:
             result = self.openclaw_client.chat_completion(
@@ -1981,6 +2418,42 @@ class ResearchService:
         if len(out) < direction_min:
             return []
         return out[:direction_max]
+
+    def _summarize_key_points(self, *, text: str, source: str) -> str:
+        source_label = "全文" if source == "fulltext" else "摘要"
+        content = (text or "").strip()
+        if not content:
+            return f"基于{source_label}：暂无可总结文本。"
+        max_chars = max(500, int(self.settings.research_summary_max_chars))
+        clipped = content[:max_chars]
+        prompt = (
+            "请基于以下内容提炼 5-8 条关键要点，覆盖问题、方法、实验、结论、局限。"
+            '返回严格 JSON: {"key_points":["..."],"notes":"...","confidence":"low|medium|high"}。\n\n'
+            f"Source: {source_label}\n"
+            f"Content:\n{clipped}"
+        )
+        try:
+            result = self.openclaw_client.chat_completion(
+                task_type=LLMTaskType.PAPER_KEYPOINTS,
+                prompt=prompt,
+                system_prompt="Return strict JSON only.",
+                temperature=0.1,
+                max_tokens=900,
+            )
+            data = _extract_first_json_object((result.text or "").strip())
+            points = [str(x).strip() for x in (data or {}).get("key_points", []) if str(x).strip()]
+            notes = str((data or {}).get("notes") or "").strip()
+            lines = [f"基于{source_label}要点："]
+            for idx, item in enumerate(points[:8], start=1):
+                lines.append(f"{idx}. {item}")
+            if notes:
+                lines.append(f"备注：{notes}")
+            if len(lines) > 1:
+                return "\n".join(lines)
+        except Exception:
+            logger.exception("paper_key_points_llm_failed")
+        sentence = clipped.split("。")[0].split(".")[0][:180]
+        return f"基于{source_label}要点：该工作围绕“{sentence}”展开，建议结合原文核验。"
 
     def _summarize_method(self, abstract: str) -> str:
         abs_text = (abstract or "").strip()
@@ -2192,6 +2665,7 @@ class ResearchService:
         latest_job = job_repo.latest_for_task(row.id)
         next_retry_job = job_repo.next_retry_for_task(row.id)
         fulltext_stats = ResearchPaperFulltextRepo(db).summary_for_task(row.id)
+        seed_stats = ResearchSeedPaperRepo(db).summary_for_task(row.id)
         latest_graph = ResearchGraphSnapshotRepo(db).latest_for_task(row.id)
         rounds_total = len(ResearchRoundRepo(db).list_for_task(row.id))
         graph_stats = _load_json_dict(latest_graph.stats_json) if latest_graph else {}
@@ -2227,6 +2701,7 @@ class ResearchService:
             "last_attempts": int(latest_job.attempts) if latest_job else 0,
             "next_retry_at": next_retry_job.scheduled_at if next_retry_job else None,
             "fulltext_stats": fulltext_stats,
+            "seed_stats": seed_stats,
             "graph_stats": graph_stats,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
@@ -2236,30 +2711,30 @@ class ResearchService:
         base = topic.strip()
         directions = [
             {
-                "name": "问题定义与评测设定",
-                "queries": [f"{base} benchmark", f"{base} evaluation metrics"],
+                "name": "生成式/端到端方案",
+                "queries": [f"{base} generative", f"{base} end-to-end model"],
                 "exclude_terms": [],
             },
             {
-                "name": "核心方法与模型架构",
-                "queries": [f"{base} method", f"{base} model architecture"],
+                "name": "检索增强/知识引入方案",
+                "queries": [f"{base} retrieval augmented", f"{base} knowledge grounded"],
                 "exclude_terms": [],
             },
             {
-                "name": "鲁棒性与泛化分析",
-                "queries": [f"{base} robustness", f"{base} generalization"],
+                "name": "模板/规则/结构化方案",
+                "queries": [f"{base} template based", f"{base} rule-based"],
                 "exclude_terms": [],
             },
         ]
         extras = [
             {
-                "name": "数据集与标注策略",
-                "queries": [f"{base} dataset", f"{base} annotation protocol"],
+                "name": "多阶段/模块化管线方案",
+                "queries": [f"{base} pipeline", f"{base} multi-stage"],
                 "exclude_terms": [],
             },
             {
-                "name": "临床/业务落地与误差分析",
-                "queries": [f"{base} deployment", f"{base} error analysis"],
+                "name": "混合/跨模态方案",
+                "queries": [f"{base} hybrid model", f"{base} multimodal"],
                 "exclude_terms": [],
             },
         ]
@@ -2336,6 +2811,31 @@ class ResearchService:
         if not value:
             return exc.__class__.__name__
         return f"{exc.__class__.__name__}:{value}"[:2000]
+
+    @staticmethod
+    def _render_saved_paper_markdown(task: ResearchTask, paper) -> str:
+        lines = [
+            f"# {paper.title}",
+            "",
+            f"- Task ID: {task.task_id}",
+            f"- Source: {paper.source}",
+            f"- Year: {paper.year or '-'}",
+            f"- Venue: {paper.venue or '-'}",
+            f"- DOI: {paper.doi or '-'}",
+            f"- URL: {paper.url or '-'}",
+            "",
+            "## Authors",
+            ", ".join(_load_json_list(paper.authors_json)) or "-",
+            "",
+            "## Abstract",
+            (paper.abstract or "-"),
+            "",
+            "## Method Summary",
+            (paper.method_summary or "-"),
+        ]
+        if paper.key_points:
+            lines.extend(["", "## AI Key Points", paper.key_points])
+        return "\n".join(lines).strip() + "\n"
 
     @staticmethod
     def _render_report(task: ResearchTask, directions: list, papers: list) -> str:

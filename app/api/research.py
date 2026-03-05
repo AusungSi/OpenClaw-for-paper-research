@@ -6,10 +6,16 @@ from sqlalchemy.orm import Session
 
 from app.api.mobile import get_current_user_id
 from app.domain.schemas import (
+    ResearchPaperDetailResponse,
     ResearchExportResponse,
     ResearchExploreStartRequest,
     ResearchExploreStartResponse,
     ResearchExploreTreeResponse,
+    ResearchPaperSaveRequest,
+    ResearchPaperSaveResponse,
+    ResearchPaperSummarizeResponse,
+    ResearchRoundNextRequest,
+    ResearchRoundNextResponse,
     ResearchFulltextBuildResponse,
     ResearchFulltextStatusResponse,
     ResearchGraphBuildRequest,
@@ -21,6 +27,7 @@ from app.domain.schemas import (
     ResearchRoundSelectRequest,
     ResearchRoundSelectResponse,
     ResearchSearchResponse,
+    ResearchSavedPaperListResponse,
     ResearchTaskCreateRequest,
     ResearchTaskListResponse,
     ResearchTaskPlanResponse,
@@ -201,9 +208,35 @@ def explore_round_select(
     return ResearchRoundSelectResponse(**data)
 
 
+@router.post("/tasks/{task_id}/explore/rounds/{round_id}/next", response_model=ResearchRoundNextResponse)
+def explore_round_next(
+    task_id: str,
+    round_id: int,
+    payload: ResearchRoundNextRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchRoundNextResponse:
+    try:
+        data = research_service.create_next_round_from_intent(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            round_id=round_id,
+            intent_text=payload.intent_text,
+            top_n=payload.top_n,
+            force_refresh=payload.force_refresh,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchRoundNextResponse(**data)
+
+
 @router.get("/tasks/{task_id}/explore/tree", response_model=ResearchExploreTreeResponse)
 def explore_tree(
     task_id: str,
+    include_papers: bool = Query(default=False),
+    paper_limit: int | None = Query(default=None, ge=1, le=50),
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
     research_service: ResearchService = Depends(get_research_service),
@@ -213,6 +246,8 @@ def explore_tree(
             db,
             user_id=user_id,
             task_id=task_id,
+            include_papers=include_papers,
+            paper_limit=paper_limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -239,6 +274,88 @@ def get_direction_papers(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ResearchSearchResponse(**data)
+
+
+@router.get("/tasks/{task_id}/papers/saved", response_model=ResearchSavedPaperListResponse)
+def get_saved_papers(
+    task_id: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchSavedPaperListResponse:
+    try:
+        data = research_service.list_saved_papers(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchSavedPaperListResponse(**data)
+
+
+@router.get("/tasks/{task_id}/papers/{paper_id:path}", response_model=ResearchPaperDetailResponse)
+def get_paper_detail(
+    task_id: str,
+    paper_id: str,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchPaperDetailResponse:
+    try:
+        data = research_service.get_paper_detail(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            paper_token=paper_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchPaperDetailResponse(**data)
+
+
+@router.post("/tasks/{task_id}/papers/{paper_id:path}/save", response_model=ResearchPaperSaveResponse)
+def save_paper(
+    task_id: str,
+    paper_id: str,
+    payload: ResearchPaperSaveRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchPaperSaveResponse:
+    try:
+        data = research_service.save_paper(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            paper_token=paper_id,
+            subdir=payload.subdir,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchPaperSaveResponse(**data)
+
+
+@router.post("/tasks/{task_id}/papers/{paper_id:path}/summarize", response_model=ResearchPaperSummarizeResponse)
+def summarize_paper(
+    task_id: str,
+    paper_id: str,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    research_service: ResearchService = Depends(get_research_service),
+) -> ResearchPaperSummarizeResponse:
+    try:
+        data = research_service.enqueue_paper_summary(
+            db,
+            user_id=user_id,
+            task_id=task_id,
+            paper_token=paper_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ResearchPaperSummarizeResponse(**data)
 
 
 @router.get("/tasks/{task_id}/export", response_model=ResearchExportResponse)
@@ -312,7 +429,7 @@ def fulltext_status(
     return ResearchFulltextStatusResponse(**data)
 
 
-@router.post("/tasks/{task_id}/papers/{paper_id}/pdf/upload")
+@router.post("/tasks/{task_id}/papers/{paper_id:path}/pdf/upload")
 async def upload_paper_pdf(
     task_id: str,
     paper_id: str,
@@ -410,6 +527,8 @@ def get_graph(
     view: str = Query(default="citation"),
     direction_index: int | None = Query(default=None),
     round_id: int | None = Query(default=None),
+    include_papers: bool = Query(default=False),
+    paper_limit: int | None = Query(default=None, ge=1, le=50),
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
     research_service: ResearchService = Depends(get_research_service),
@@ -422,6 +541,8 @@ def get_graph(
             direction_index=direction_index,
             round_id=round_id,
             view=view,
+            include_papers=include_papers,
+            paper_limit=paper_limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

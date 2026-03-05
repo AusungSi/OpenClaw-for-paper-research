@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from urllib.parse import quote
 import orjson
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -29,6 +30,14 @@ class FakeOpenClawClient:
         if task_type == LLMTaskType.ABSTRACT_SUMMARIZE:
             return LLMCallResult(
                 text="基于摘要总结：方法有效。",
+                provider="fake",
+                model="fake",
+                latency_ms=1,
+                via_fallback=False,
+            )
+        if task_type == LLMTaskType.PAPER_KEYPOINTS:
+            return LLMCallResult(
+                text='{"key_points":["point a","point b"],"notes":"ok","confidence":"medium"}',
                 provider="fake",
                 model="fake",
                 latency_ms=1,
@@ -304,6 +313,138 @@ def test_explore_round_flow_and_tree_endpoint():
         assert "topic" in node_types
         assert "direction" in node_types
         assert "round" in node_types
+    finally:
+        client.close()
+        db_session.close()
+
+
+def test_explore_next_endpoint_and_tree_feedback():
+    client, service, user, db_session = _build_test_client()
+    try:
+        task = service.create_task(
+            db_session,
+            user_id=user.id,
+            topic="api next topic",
+            constraints={"top_n": 5},
+        )
+        service._build_seed_corpus_for_task = lambda db, task, constraints: []  # noqa: E731
+        service.process_one_job(db_session)
+        service._search_semantic_scholar = lambda query, *, top_n, constraints: (  # noqa: E731
+            [
+                {
+                    "paper_id": "n1",
+                    "title": "Next Seed Paper",
+                    "title_norm": "next seed paper",
+                    "authors": ["A"],
+                    "year": 2025,
+                    "venue": "MICCAI",
+                    "doi": "10.1000/n1",
+                    "url": "https://example.org/n1",
+                    "abstract": "abstract",
+                    "source": "semantic_scholar",
+                    "relevance_score": None,
+                }
+            ],
+            "ok",
+            None,
+        )
+        service._search_arxiv = lambda query, *, top_n, constraints: ([], "ok_empty", None)  # noqa: E731
+
+        start_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/explore/start",
+            json={"direction_index": 1},
+        )
+        assert start_resp.status_code == 200
+        round_id = start_resp.json()["round_id"]
+        service.process_one_job(db_session)
+
+        next_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/explore/rounds/{round_id}/next",
+            json={"intent_text": "继续调研 VLM 的 hallucination 评估与缓解"},
+        )
+        assert next_resp.status_code == 200
+        child_round_id = next_resp.json()["child_round_id"]
+        assert child_round_id > round_id
+        service.process_one_job(db_session)
+
+        tree_resp = client.get(f"/api/v1/research/tasks/{task.task_id}/explore/tree")
+        assert tree_resp.status_code == 200
+        tree = tree_resp.json()
+        round_nodes = [x for x in tree["nodes"] if x["type"] == "round" and x.get("feedback_text")]
+        assert any("VLM" in (x.get("feedback_text") or "") for x in round_nodes)
+    finally:
+        client.close()
+        db_session.close()
+
+
+def test_paper_save_and_summarize_endpoints():
+    client, service, user, db_session = _build_test_client()
+    try:
+        task = service.create_task(
+            db_session,
+            user_id=user.id,
+            topic="api save summary topic",
+            constraints={"top_n": 5},
+        )
+        service._build_seed_corpus_for_task = lambda db, task, constraints: []  # noqa: E731
+        service.process_one_job(db_session)
+        service._search_semantic_scholar = lambda query, *, top_n, constraints: (  # noqa: E731
+            [
+                {
+                    "paper_id": "s1",
+                    "title": "Savable Paper",
+                    "title_norm": "savable paper",
+                    "authors": ["A"],
+                    "year": 2025,
+                    "venue": "MICCAI",
+                    "doi": "10.1000/s1",
+                    "url": "https://example.org/s1",
+                    "abstract": "this is abstract for key points",
+                    "source": "semantic_scholar",
+                    "relevance_score": None,
+                }
+            ],
+            "ok",
+            None,
+        )
+        service._search_arxiv = lambda query, *, top_n, constraints: ([], "ok_empty", None)  # noqa: E731
+
+        search_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/search",
+            json={"direction_index": 1, "top_n": 5},
+        )
+        assert search_resp.status_code == 200
+        service.process_one_job(db_session)
+
+        papers_resp = client.get(f"/api/v1/research/tasks/{task.task_id}/papers?direction_index=1&page=1")
+        assert papers_resp.status_code == 200
+        paper_id = papers_resp.json()["items"][0]["doi"]
+        paper_token = quote(str(paper_id), safe="")
+
+        save_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/papers/{paper_token}/save",
+            json={},
+        )
+        assert save_resp.status_code == 200
+        assert save_resp.json()["saved"] is True
+
+        saved_resp = client.get(f"/api/v1/research/tasks/{task.task_id}/papers/saved")
+        assert saved_resp.status_code == 200
+        assert len(saved_resp.json()["items"]) >= 1
+
+        summarize_resp = client.post(
+            f"/api/v1/research/tasks/{task.task_id}/papers/{paper_token}/summarize",
+        )
+        assert summarize_resp.status_code == 200
+        assert summarize_resp.json()["key_points_status"] == "queued"
+        service.process_one_job(db_session)
+
+        detail_resp = client.get(f"/api/v1/research/tasks/{task.task_id}/papers/{paper_token}")
+        assert detail_resp.status_code == 200
+        detail = detail_resp.json()
+        assert detail["saved"] is True
+        assert detail["key_points_status"] == "done"
+        assert detail["key_points_source"] in {"abstract", "fulltext"}
     finally:
         client.close()
         db_session.close()

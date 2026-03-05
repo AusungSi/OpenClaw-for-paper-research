@@ -176,6 +176,7 @@ class ResearchTask(Base):
 
     user: Mapped["User"] = relationship(back_populates="research_tasks")
     directions: Mapped[list["ResearchDirection"]] = relationship(back_populates="task")
+    seed_papers: Mapped[list["ResearchSeedPaper"]] = relationship(back_populates="task")
     jobs: Mapped[list["ResearchJob"]] = relationship(back_populates="task")
 
 
@@ -195,6 +196,31 @@ class ResearchDirection(Base):
 
     task: Mapped["ResearchTask"] = relationship(back_populates="directions")
     papers: Mapped[list["ResearchPaper"]] = relationship(back_populates="direction")
+
+
+class ResearchSeedPaper(Base):
+    __tablename__ = "research_seed_papers"
+    __table_args__ = (
+        UniqueConstraint("task_id", "doi", name="uq_research_seed_paper_task_doi"),
+        UniqueConstraint("task_id", "title_norm", name="uq_research_seed_paper_task_title_norm"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), nullable=False)
+    paper_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    title_norm: Mapped[str] = mapped_column(String(512), nullable=False)
+    authors_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    venue: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    doi: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    abstract: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    task: Mapped["ResearchTask"] = relationship(back_populates="seed_papers")
 
 
 class ResearchPaper(Base):
@@ -219,6 +245,15 @@ class ResearchPaper(Base):
     method_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     relevance_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    saved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    saved_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    saved_bib_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    saved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    key_points: Mapped[str | None] = mapped_column(Text, nullable=True)
+    key_points_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    key_points_status: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    key_points_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    key_points_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

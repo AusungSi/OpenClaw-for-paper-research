@@ -9,6 +9,7 @@ from app.api.health import router as health_router
 from app.api.mobile import router as mobile_router
 from app.api.research import router as research_router
 from app.api.research_ui import router as research_ui_router
+from app.api.dev import router as dev_router
 from app.api.wechat import router as wechat_router
 from app.core.config import get_settings
 from app.core.logging import get_logger, setup_logging
@@ -111,4 +112,5 @@ app.include_router(health_router)
 app.include_router(mobile_router)
 app.include_router(research_router)
 app.include_router(research_ui_router)
+app.include_router(dev_router)
 app.include_router(admin_router)

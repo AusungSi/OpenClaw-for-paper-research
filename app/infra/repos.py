@@ -32,6 +32,7 @@ from app.domain.models import (
     ResearchCitationEdge,
     ResearchGraphSnapshot,
     ResearchPaper,
+    ResearchSeedPaper,
     ResearchPaperFulltext,
     ResearchRound,
     ResearchRoundCandidate,
@@ -71,6 +72,15 @@ class UserRepo:
 
     def get_by_wecom_id(self, wecom_user_id: str) -> User | None:
         return self.db.execute(select(User).where(User.wecom_user_id == wecom_user_id)).scalar_one_or_none()
+
+    def list_wecom_ids(self, limit: int = 100) -> list[str]:
+        stmt = (
+            select(User.wecom_user_id)
+            .order_by(desc(User.updated_at), desc(User.id))
+            .limit(max(1, min(500, int(limit))))
+        )
+        rows = self.db.execute(stmt).all()
+        return [str(row[0]) for row in rows if row and row[0]]
 
 
 class InboundMessageRepo:
@@ -415,6 +425,10 @@ class ResearchTaskRepo:
         )
         return list(self.db.execute(stmt).scalars().all())
 
+    def list_recent_all(self, limit: int = 200) -> list[ResearchTask]:
+        stmt = select(ResearchTask).order_by(ResearchTask.created_at.desc()).limit(limit)
+        return list(self.db.execute(stmt).scalars().all())
+
     def update_status(self, row: ResearchTask, status: ResearchTaskStatus) -> ResearchTask:
         row.status = status
         row.updated_at = datetime.now(timezone.utc)
@@ -504,6 +518,72 @@ class ResearchDirectionRepo:
         row.updated_at = datetime.now(timezone.utc)
         self.db.add(row)
         self.db.flush()
+
+
+class ResearchSeedPaperRepo:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def replace_for_task(self, task_id: int, papers: list[dict]) -> list[ResearchSeedPaper]:
+        self.db.query(ResearchSeedPaper).filter(ResearchSeedPaper.task_id == task_id).delete()
+        now = datetime.now(timezone.utc)
+        rows: list[ResearchSeedPaper] = []
+        seen_doi: set[str] = set()
+        seen_title: set[str] = set()
+        for item in papers:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            doi = str(item.get("doi") or "").strip().lower()
+            title_norm = str(item.get("title_norm") or "").strip()[:512]
+            if doi and doi in seen_doi:
+                continue
+            if title_norm and title_norm in seen_title:
+                continue
+            row = ResearchSeedPaper(
+                task_id=task_id,
+                paper_id=(str(item.get("paper_id") or "").strip() or None),
+                title=title[:10000],
+                title_norm=title_norm,
+                authors_json=orjson.dumps(item.get("authors") or []).decode("utf-8"),
+                year=int(item.get("year")) if str(item.get("year") or "").isdigit() else None,
+                venue=(str(item.get("venue") or "").strip()[:255] or None),
+                doi=(doi or None),
+                url=(str(item.get("url") or "").strip() or None),
+                abstract=(str(item.get("abstract") or "").strip() or None),
+                source=str(item.get("source") or "unknown")[:64],
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(row)
+            rows.append(row)
+            if doi:
+                seen_doi.add(doi)
+            if title_norm:
+                seen_title.add(title_norm)
+        self.db.flush()
+        return rows
+
+    def list_for_task(self, task_id: int, *, limit: int | None = None) -> list[ResearchSeedPaper]:
+        stmt = select(ResearchSeedPaper).where(ResearchSeedPaper.task_id == task_id).order_by(ResearchSeedPaper.id.asc())
+        if limit is not None and limit > 0:
+            stmt = stmt.limit(limit)
+        return list(self.db.execute(stmt).scalars().all())
+
+    def summary_for_task(self, task_id: int) -> dict[str, int]:
+        total = self.db.execute(
+            select(func.count(ResearchSeedPaper.id)).where(ResearchSeedPaper.task_id == task_id)
+        ).scalar_one()
+        with_abstract = self.db.execute(
+            select(func.count(ResearchSeedPaper.id)).where(
+                and_(
+                    ResearchSeedPaper.task_id == task_id,
+                    ResearchSeedPaper.abstract.is_not(None),
+                    ResearchSeedPaper.abstract != "",
+                )
+            )
+        ).scalar_one()
+        return {"total": int(total or 0), "with_abstract": int(with_abstract or 0)}
 
 
 class ResearchPaperRepo:
@@ -676,6 +756,48 @@ class ResearchPaperRepo:
             )
         )
         return self.db.execute(stmt).scalar_one_or_none()
+
+    def mark_saved(self, row: ResearchPaper, *, md_path: str, bib_path: str) -> ResearchPaper:
+        now = datetime.now(timezone.utc)
+        row.saved = True
+        row.saved_path = md_path
+        row.saved_bib_path = bib_path
+        row.saved_at = now
+        row.updated_at = now
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def list_saved_for_task(self, task_id: int, *, limit: int = 200) -> list[ResearchPaper]:
+        stmt = (
+            select(ResearchPaper)
+            .where(and_(ResearchPaper.task_id == task_id, ResearchPaper.saved.is_(True)))
+            .order_by(desc(ResearchPaper.saved_at), desc(ResearchPaper.id))
+            .limit(max(1, min(1000, int(limit))))
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def update_key_points(
+        self,
+        row: ResearchPaper,
+        *,
+        status: str,
+        key_points: str | None = None,
+        source: str | None = None,
+        error: str | None = None,
+    ) -> ResearchPaper:
+        now = datetime.now(timezone.utc)
+        row.key_points_status = status[:16]
+        if key_points is not None:
+            row.key_points = key_points
+        if source is not None:
+            row.key_points_source = source[:32]
+        row.key_points_error = error
+        row.key_points_updated_at = now
+        row.updated_at = now
+        self.db.add(row)
+        self.db.flush()
+        return row
 
 
 class ResearchPaperFulltextRepo:

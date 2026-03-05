@@ -37,6 +37,14 @@ class FakeOpenClawClient:
                 latency_ms=1,
                 via_fallback=False,
             )
+        if task_type == LLMTaskType.PAPER_KEYPOINTS:
+            return LLMCallResult(
+                text='{"key_points":["要点1","要点2"],"notes":"ok","confidence":"medium"}',
+                provider="fake",
+                model="fake",
+                latency_ms=1,
+                via_fallback=False,
+            )
         raise AssertionError(f"unexpected task type: {task_type}")
 
 
@@ -171,6 +179,7 @@ def test_research_job_retry_then_fail(db_session):
         def fail_plan(topic: str, constraints: dict):
             raise RuntimeError("plan boom")
 
+        service._build_seed_corpus_for_task = lambda db, task, constraints: []  # noqa: E731
         service._plan_directions = fail_plan
 
         processed = service.process_one_job(db_session)
@@ -272,6 +281,7 @@ def test_research_cache_hit_and_force_refresh(db_session):
         topic="cache topic",
         constraints={"sources": ["semantic_scholar"], "top_n": 5},
     )
+    service._build_seed_corpus_for_task = lambda db, task, constraints: []  # noqa: E731
     service._plan_directions = lambda _topic, _constraints: [  # noqa: E731
         {"name": "方向A", "queries": ["cache query"], "exclude_terms": []},
     ]

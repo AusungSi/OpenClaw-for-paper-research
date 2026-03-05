@@ -14,6 +14,7 @@ def _build_settings() -> Settings:
         openclaw_agent_id="memomate",
         openclaw_retries=1,
         openclaw_timeout_seconds=3,
+        openclaw_cli_fallback_enabled=True,
     )
 
 

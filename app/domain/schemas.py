@@ -447,6 +447,14 @@ class ResearchGraphNode(BaseModel):
     depth: int | None = None
     action: str | None = None
     status: str | None = None
+    paper_id: str | None = None
+    venue: str | None = None
+    doi: str | None = None
+    url: str | None = None
+    abstract: str | None = None
+    method_summary: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    feedback_text: str | None = None
 
 
 class ResearchGraphEdge(BaseModel):
@@ -535,6 +543,20 @@ class ResearchRoundSelectResponse(BaseModel):
     queued: bool = True
 
 
+class ResearchRoundNextRequest(BaseModel):
+    intent_text: str
+    top_n: int | None = None
+    force_refresh: bool = False
+
+
+class ResearchRoundNextResponse(BaseModel):
+    task_id: str
+    parent_round_id: int
+    child_round_id: int
+    status: str
+    queued: bool = True
+
+
 class ResearchExploreTreeResponse(BaseModel):
     task_id: str
     nodes: list[ResearchGraphNode] = Field(default_factory=list)
@@ -561,6 +583,7 @@ class ResearchPaperItem(BaseModel):
     abstract: str | None = None
     method_summary: str = ""
     source: str
+    saved: bool = False
 
 
 class ResearchTaskResponse(BaseModel):
@@ -577,6 +600,7 @@ class ResearchTaskResponse(BaseModel):
     last_attempts: int = 0
     next_retry_at: datetime | None = None
     fulltext_stats: dict[str, int] = Field(default_factory=dict)
+    seed_stats: dict[str, int] = Field(default_factory=dict)
     graph_stats: dict = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
@@ -600,3 +624,66 @@ class ResearchExportResponse(BaseModel):
     task_id: str
     format: str
     path: str
+
+
+class ResearchPaperSaveRequest(BaseModel):
+    subdir: str | None = None
+
+
+class ResearchPaperSaveResponse(BaseModel):
+    task_id: str
+    paper_id: str
+    saved: bool
+    saved_path: str
+    saved_bib_path: str
+    saved_at: datetime | None = None
+
+
+class ResearchPaperSummarizeResponse(BaseModel):
+    task_id: str
+    paper_id: str
+    key_points_status: str
+    queued: bool = True
+
+
+class ResearchSavedPaperItem(BaseModel):
+    paper_id: str
+    title: str
+    year: int | None = None
+    doi: str | None = None
+    saved_path: str | None = None
+    saved_bib_path: str | None = None
+    saved_at: datetime | None = None
+
+
+class ResearchSavedPaperListResponse(BaseModel):
+    task_id: str
+    items: list[ResearchSavedPaperItem] = Field(default_factory=list)
+
+
+class ResearchPaperDetailResponse(BaseModel):
+    task_id: str
+    paper_id: str
+    title: str
+    authors: list[str] = Field(default_factory=list)
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    url: str | None = None
+    abstract: str | None = None
+    method_summary: str = ""
+    source: str
+    fulltext_status: str | None = None
+    saved: bool = False
+    saved_path: str | None = None
+    saved_bib_path: str | None = None
+    saved_at: datetime | None = None
+    key_points_status: str = "none"
+    key_points_source: str | None = None
+    key_points: str | None = None
+    key_points_error: str | None = None
+    key_points_updated_at: datetime | None = None
+
+
+class DevUserListResponse(BaseModel):
+    users: list[str] = Field(default_factory=list)

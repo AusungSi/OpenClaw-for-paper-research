@@ -21,6 +21,7 @@ class LLMTaskType(str, Enum):
     INTENT_PARSE = "intent_parse"
     RESEARCH_PLAN = "research_plan"
     ABSTRACT_SUMMARIZE = "abstract_summarize"
+    PAPER_KEYPOINTS = "paper_keypoints"
 
 
 @dataclass
@@ -101,6 +102,14 @@ class OpenClawClient:
                     break
             if attempt < retries - 1:
                 sleep(min(1.6, 0.2 * (2**attempt)))
+
+        if not self.settings.openclaw_cli_fallback_enabled:
+            err = str(last_error) if last_error else "unknown_openclaw_error"
+            raise OpenClawClientError(
+                "openclaw_http_failed",
+                f"http_failed_no_cli_fallback:{err}",
+                retriable=False,
+            )
 
         self.openclaw_cli_fallback_count += 1
         try:
